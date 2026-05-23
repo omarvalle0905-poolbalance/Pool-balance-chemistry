@@ -1,0 +1,1053 @@
+# ENTREGABLE G — PROYECTOR TEMPORAL DEL ISPB
+
+**Versión:** chemistry.js v16.7.0
+**Autor:** Omar Alberto Valle Mercado · RFC VAMO870509HW3
+**Doctrina madre:** Sección 14 del CÓDYCE NEXUS V17.8
+**Prerequisito:** PASO 1 (Wojtowicz dinámico) integrado en el mismo v16.7.0
+**Estatus:** Implementación final alineada a doctrina. Listo para inyección.
+**Fecha:** Mayo 2026
+
+---
+
+## ÍNDICE DE INSERCIÓN
+
+1. **PASO 0** — Actualizar cabecera del archivo y `Chemistry.VERSION`.
+2. **P.1** — Constantes nuevas en `Chemistry.CONST`.
+3. **P.2** — Helpers privados de física.
+4. **P.3** — Despachador de eventos con integración dinámica del Entregable F.
+5. **P.4** — Generador de recomendación operativa.
+6. **P.5** — Función pública `proyectarISPB`.
+7. **P.6** — Suite de tests `TESTS_PROYECTOR_V17_8` (6 casos doctrinales).
+8. **P.7** — Export Node/CommonJS y `window.Chemistry`.
+9. **Checklist de integración** desde GitHub móvil.
+10. **Invocación típica** desde `isaias.js`.
+11. **Deudas técnicas** declaradas (D1-D4).
+12. **Criterios de promoción** a producción (V1-V4).
+
+---
+
+## PASO 0 — Cabecera del archivo y VERSION
+
+Reemplaza el bloque de comentario superior `VERSIÓN: 16.6.0 ...` añadiendo arriba este changelog combinado (Wojtowicz + Proyector ambos bajo v16.7.0 según doctrina):
+
+```js
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * POOL BALANCE — Motor Químico V16.7.0 (Gemelo Digital Ciber-Físico)
+ * Factor Omar · Índice de Saturación Pool Balance (ISPB)
+ *
+ * © Omar Alberto Valle Mercado | RFC: VAMO870509HW3
+ * Pool Balance - Gestoría Hídrica Profesional
+ *
+ * VERSIÓN: 16.7.0 — Wojtowicz dinámica + Proyector Temporal del ISPB
+ *
+ *   PASO 1 — Refactor calcISV con Wojtowicz dinámica:
+ *   - V16.7.0 ADD CONST WOJTOWICZ_TABLA (8 pares pH-factor).
+ *   - V16.7.0 ADD METHOD _factorWojtowicz(ph) — interpolación lineal.
+ *   - V16.7.0 MOD calcISV: alkCorr = alkN - (cianN * factorWoj),
+ *     reemplaza heurística alkN - (cianN/3). Retorna campos
+ *     wojtowicz_factor y wojtowicz_metodo para trazabilidad.
+ *
+ *   ENTREGABLE G — Proyector Temporal del ISPB (Sección 14 del Códyce):
+ *   - V16.7.0 ADD CONST: bloque PROYECTOR_*, DESGASIFICACION_VEL_BASE,
+ *     ZONAS_RECUBRIMIENTO replicada del hardcode de calcISV (deuda D2).
+ *   - V16.7.0 ADD METHODS privados:
+ *       _techoSuavizadoDesgasificacion(pH)
+ *       _evaporacionFactorHora(prof_m, evap_mm_dia)
+ *       _zonaSeguridadRecubrimiento(rec)
+ *       _recalcularPHsProyector(estado, F_T)
+ *       _aplicarEventoProyector(estado, evento, vol_m3)
+ *       _proyectorRecomendacion(alerta, zona, h, regimen)
+ *   - V16.7.0 ADD METHOD público: proyectarISPB(estadoInicial,
+ *     horizonte_h, eventos, opciones). Integración Euler paso 1 h,
+ *     horizonte máximo 168 h, detección de cruce con confirmación
+ *     de 3 puntos consecutivos.
+ *   - V16.7.0 INTEGRA dinámicamente calcDeltaPhPorDosificacion
+ *     (Sección 13) si está presente; fallback a coeficientes
+ *     lineales (deuda D1).
+ *   - V16.7.0 ADD TESTS: TESTS_PROYECTOR_V17_8 (6 casos T_PROJ_01..06)
+ *     y ejecutarTestsProyector(). Criterio de promoción 6/6 verde.
+ *
+ *   DEUDAS TÉCNICAS DECLARADAS:
+ *   - D1: aproximaciones lineales en _aplicarEventoProyector se
+ *         reemplazarán por calcDeltaPhPorDosificacion (Sección 13)
+ *         cuando supere validación retrospectiva en ≥5 clientes.
+ *   - D2: ZONAS_RECUBRIMIENTO duplicada en CONST y calcISV.
+ *         Refactorizar calcISV para que la consuma de CONST.
+ *   - D3: temperatura constante durante el horizonte. v2 soportará T(t).
+ *   - D4: velocidad de desgasificación con kLa empírico por sitio.
+ *
+ * VERSIÓN: 16.6.0 — Helpers calcFraccionHOCl y calcHOClActivo
+ *   [... resto del changelog histórico sin cambios ...]
+ * ═══════════════════════════════════════════════════════════════
+ */
+```
+
+Y dentro del objeto `Chemistry`, cambiar:
+
+```js
+VERSION: '16.6.0',
+```
+
+por:
+
+```js
+VERSION: '16.7.0',
+```
+
+---
+
+## P.1 — Constantes nuevas
+
+Pegar **dentro de `Chemistry.CONST`**, después de `WOJTOWICZ_TABLA` (insertada por el PASO 1) y **antes** de `FIRMA`:
+
+```js
+    // ━━━ INICIO P.1 — Constantes del Proyector Temporal v16.7.0 ━━━
+
+    // Velocidad base de desgasificación de CO₂ (Δ pH por hora)
+    // Sección 14.3.1 del Códyce · Calibración Pool Balance Veracruz
+    DESGASIFICACION_VEL_BASE: {
+      reposo:      0.003,  // alberca cerrada, sin recirculación
+      filtracion:  0.015,  // bomba operando, sin atomización
+      cascada:     0.080,  // cascada/fuente activa
+      spa_venturi: 0.150   // spa con inyectores Venturi
+    },
+
+    // Techo asintótico de pH por desgasificación natural
+    PH_EQUILIBRIO_TECHO:      8.4,
+    PH_INICIO_DECAIMIENTO:    8.0,
+
+    // Evaporación promedio (mm/día) si no se especifica
+    EVAPORACION_MM_DIA_DEFAULT: 4.0,
+
+    // Parámetros del proyector
+    PROYECTOR_PASO_HORAS:               1,
+    PROYECTOR_HORIZONTE_MAX:            168,  // 7 días (hard-stop defensivo)
+    PROYECTOR_PUNTOS_CRUCE_CONFIRMACION: 3,
+
+    // Modos operativos donde el proyector NO debe ejecutarse
+    // (Sección 14.8.3 del Códyce)
+    PROYECTOR_MODOS_PROHIBIDOS: ['rescate', 'metales', 'recuperacion_severa'],
+
+    // Dilución por retrolavado por defecto (%)
+    PROYECTOR_RETROLAVADO_PCT_DEFAULT: 5,
+
+    // Aporte de ALK por lluvia (ppm). Conservador: lluvia urbana ~0.
+    PROYECTOR_LLUVIA_ALK_PPM: 0,
+
+    // ─────────────────────────────────────────────────────────
+    // ZONAS_RECUBRIMIENTO — Replicado del hardcode en calcISV
+    // (chemistry v16.6.0). Deuda D2: refactorizar calcISV para
+    // que consuma esta constante.
+    // ─────────────────────────────────────────────────────────
+    ZONAS_RECUBRIMIENTO: {
+      porcelanato: { min: -0.10, max: 0.30 },
+      veneciano:   { min: -0.10, max: 0.30 },
+      fibra:       { min: -0.30, max: 0.10 },
+      pebble:      { min: -0.20, max: 0.50 },
+      vinil:       { min: -0.30, max: 0.20 },
+      azulejo:     { min: -0.15, max: 0.35 },
+      concreto:    { min: -0.20, max: 0.40 },
+      piedra:      { min: -0.20, max: 0.50 }
+    },
+
+    // ─────────────────────────────────────────────────────────
+    // Coeficientes lineales de fallback (deuda D1).
+    // Sólo se usan si calcDeltaPhPorDosificacion (Sección 13)
+    // NO está disponible. Unidades indicadas por producto.
+    // Calibrados contra calcDeltaPorAplicacion v16.6.0.
+    // ─────────────────────────────────────────────────────────
+    PROYECTOR_COEF_DOSIS: {
+      // [g/m³] → ΔpH, ΔFC, ΔCYA, ΔALK
+      dosis_tricloro:         { dpH: -0.020,    dFC:  0.90, dCYA:  0.55, dALK:  0.00 },
+      dosis_hipo_calcio:      { dpH:  0.0005,   dFC:  0.65, dCYA:  0.00, dALK:  0.00 },
+      // [g/m³] cloro líquido 10% activo (densidad ~1 kg/L)
+      dosis_cloro_liquido:    { dpH:  0.000003, dFC:  0.10, dCYA:  0.00, dALK:  0.0014 },
+      // [g/m³] Bisulfato Klaren comercial ~50%
+      dosis_bisulfato_klaren: { dpH: -0.0018,   dFC:  0.00, dCYA:  0.00, dALK: -0.196 },
+      // [mL/m³] ácido muriático 31%
+      dosis_acido_muriatico:  { dpH: -0.0001,   dFC:  0.00, dCYA:  0.00, dALK: -0.05  },
+      // [g/m³] Alkalin (NaHCO3). CORREGIDO: 0.595 (no 0.0595)
+      dosis_alkalin:          { dpH:  0.00018,  dFC:  0.00, dCYA:  0.00, dALK:  0.595 }
+    },
+
+    // ━━━ FIN P.1 ━━━
+```
+
+---
+
+## P.2 — Helpers privados de física
+
+Pegar **como métodos del objeto `Chemistry`**, justo después de `_factorTemp` y `_factorWojtowicz`:
+
+```js
+  // ━━━ INICIO P.2 — Helpers físicos del proyector v16.7.0 ━━━
+
+  /**
+   * Techo suavizado de desgasificación entre pH 8.0 y 8.4.
+   * Factor 1.0 si pH <= 8.0; baja linealmente a 0.0 en pH >= 8.4.
+   * Evita que el pH se dispare más allá del equilibrio CO₂ atmosférico.
+   * Sección 14.3.1(a) del Códyce.
+   * @param {number} pH
+   * @returns {number} factor entre 0 y 1
+   */
+  _techoSuavizadoDesgasificacion(pH) {
+    const inicio = this.CONST.PH_INICIO_DECAIMIENTO; // 8.0
+    const techo  = this.CONST.PH_EQUILIBRIO_TECHO;   // 8.4
+    if (pH <= inicio) return 1.0;
+    if (pH >= techo)  return 0.0;
+    return (techo - pH) / (techo - inicio);
+  },
+
+  /**
+   * Factor de concentración por evaporación, por hora.
+   * Devuelve el factor multiplicativo de concentración de iones
+   * (ALK, CH, CYA, TDS) por la pérdida de agua. Asume agua de
+   * reposición NO compensada en el horizonte (peor caso conservador).
+   * Sección 14.3.4(a) del Códyce.
+   * @param {number} prof_m - profundidad promedio (m)
+   * @param {number} evap_mm_dia - evaporación mm/día
+   * @returns {number} factor por hora (~1.0001 típico)
+   */
+  _evaporacionFactorHora(prof_m, evap_mm_dia) {
+    const prof = (prof_m > 0) ? prof_m : 1.5;
+    const evap = (evap_mm_dia >= 0) ? evap_mm_dia : this.CONST.EVAPORACION_MM_DIA_DEFAULT;
+    // Fracción de volumen perdida por hora = (mm/día) / (24 * prof_mm)
+    const fraccionHora = (evap / 24) / (prof * 1000);
+    // Concentración ∝ 1 / (1 - fracción perdida)
+    return 1 / (1 - fraccionHora);
+  },
+
+  /**
+   * Devuelve la zona de seguridad ISPB del recubrimiento.
+   * Lee de Chemistry.CONST.ZONAS_RECUBRIMIENTO.
+   * Sección 14.3.6 del Códyce.
+   * @param {string} recubrimiento
+   * @returns {{min:number, max:number, recubrimiento:string}}
+   */
+  _zonaSeguridadRecubrimiento(recubrimiento) {
+    const tabla = this.CONST.ZONAS_RECUBRIMIENTO;
+    const key = (typeof recubrimiento === 'string') ? recubrimiento : 'porcelanato';
+    const z = tabla[key] || tabla.porcelanato;
+    return { min: z.min, max: z.max, recubrimiento: tabla[key] ? key : 'porcelanato' };
+  },
+
+  /**
+   * Recalcula pHs (Langelier) e ISPB del estado actual usando
+   * la misma fórmula que calcISV. Incluye corrección Wojtowicz
+   * dinámica (vía _factorWojtowicz). Muta el estado in-place.
+   * Sección 14.3.6 del Códyce.
+   * @param {object} estado - {pH, ALK, CH, CYA, TDS, temperatura}
+   * @param {number} F_T - factor de temperatura precalculado
+   */
+  _recalcularPHsProyector(estado, F_T) {
+    const phN  = estado.pH;
+    const alkN = Math.max(1, estado.ALK);
+    const chN  = Math.max(1, estado.CH);
+    const cyaN = Math.max(0, estado.CYA);
+    const tdsN = Math.max(0, estado.TDS || 0);
+
+    // Corrección Wojtowicz dinámica (v16.7.0 PASO 1)
+    let factorWoj, alkCorr;
+    if (typeof this._factorWojtowicz === 'function') {
+      factorWoj = this._factorWojtowicz(phN);
+      alkCorr   = Math.max(1, alkN - (cyaN * factorWoj));
+    } else {
+      factorWoj = 1 / 3;
+      alkCorr   = Math.max(1, alkN - (cyaN / 3));
+    }
+
+    const F_CH  = Math.log10(chN);
+    const F_ALK = Math.log10(alkCorr);
+    let   F_TDS = 0;
+    if (tdsN > 1000) F_TDS = 0.1 * Math.log10(tdsN / 1000);
+
+    const LANGELIER_CONST = 12.1;
+    const pHs  = LANGELIER_CONST + F_TDS - F_T - F_CH - F_ALK;
+    const ispb = phN - pHs;
+
+    estado.pHs              = parseFloat(pHs.toFixed(3));
+    estado.ispb             = parseFloat(ispb.toFixed(3));
+    estado.alkCorr          = parseFloat(alkCorr.toFixed(2));
+    estado.wojtowicz_factor = parseFloat(factorWoj.toFixed(4));
+  },
+
+  // ━━━ FIN P.2 ━━━
+```
+
+---
+
+## P.3 — Despachador de eventos
+
+Pegar **como método del objeto `Chemistry`**, después del bloque P.2.
+
+**NOMENCLATURA DOCTRINAL** (Sección 14.5 del Códyce):
+- Tipos de evento: `dosis_tricloro`, `dosis_hipo_calcio`, `dosis_acido_muriatico`, `dosis_bisulfato_klaren`, `dosis_alkalin`, `dosis_cloro_liquido`, `lluvia`, `retrolavado`.
+- Payload de dosis: `cantidad_g` (gramos) o `cantidad_ml` (mililitros).
+- Payload de lluvia/retrolavado: `volumen_pct` (porcentaje del volumen del vaso).
+
+```js
+  // ━━━ INICIO P.3 — Despachador de eventos del proyector v16.7.0 ━━━
+
+  /**
+   * Aplica un evento programado al estado del agua.
+   * Sección 14.5 del Códyce.
+   *
+   * INTEGRACIÓN DINÁMICA CON SECCIÓN 13 (calcDeltaPhPorDosificacion):
+   *   Si la función está definida, se usa para todas las dosis y se
+   *   consumen phFinalBase, alkTotalFinal, cyaFinal, deltaCH del
+   *   retorno estructurado. Si NO está definida, fallback a
+   *   coeficientes lineales de CONST.PROYECTOR_COEF_DOSIS (deuda D1).
+   *
+   * @param {object} estado - mutado in-place
+   * @param {object} evento - {tipo, hora, cantidad_g|cantidad_ml|volumen_pct}
+   * @param {number} volumen_m3 - volumen del vaso de la alberca
+   */
+  _aplicarEventoProyector(estado, evento, volumen_m3) {
+    if (!evento || !evento.tipo) return;
+    const V = (volumen_m3 > 0) ? volumen_m3 : 1;
+    const tipo = String(evento.tipo).toLowerCase();
+    const tieneF = (typeof this.calcDeltaPhPorDosificacion === 'function');
+
+    // ─── Mapeo de tipos doctrinales a producto del Entregable F ───
+    const mapaProductoF = {
+      dosis_tricloro:         'tricloro',
+      dosis_hipo_calcio:      'hipo_calcio',
+      dosis_cloro_liquido:    'cloro_liquido',
+      dosis_bisulfato_klaren: 'bisulfato',
+      dosis_acido_muriatico:  'muriatico',
+      dosis_alkalin:          'alkalin'
+    };
+
+    // ───── DOSIS DE PRODUCTO ─────
+    if (mapaProductoF[tipo]) {
+      // Aceptar cantidad_g, cantidad_ml, o fallback de payload viejo
+      let gramos = parseFloat(evento.cantidad_g || 0);
+      if (gramos <= 0 && evento.cantidad_ml) {
+        // Para ácido muriático y cloro líquido, convertir mL a g
+        // (densidades ~1.16 muriático, ~1.0 cloro líquido — aprox)
+        const densidad = (tipo === 'dosis_acido_muriatico') ? 1.16 : 1.0;
+        gramos = parseFloat(evento.cantidad_ml) * densidad;
+      }
+      if (gramos <= 0) return;
+
+      if (tieneF) {
+        // ── Camino preciso (Entregable F / Sección 13) ──
+        try {
+          const productoF = mapaProductoF[tipo];
+          const lecturas = {
+            pH:     estado.pH,
+            ALK:    estado.ALK,
+            CYA:    estado.CYA,
+            FC:     estado.FC || 0,
+            T_agua: estado.temperatura
+          };
+          const r = this.calcDeltaPhPorDosificacion(productoF, gramos, V, lecturas, {});
+          if (r && typeof r.phFinalBase === 'number') {
+            estado.pH  = r.phFinalBase;
+            estado.ALK = r.alkTotalFinal;
+            estado.CYA = r.cyaFinal;
+            estado.CH  = (estado.CH || 0) + (r.deltaCH || 0);
+            // FC: el Entregable F no lo recalcula; se suma por
+            // estequiometría del coeficiente lineal correspondiente.
+            const coefFC = this.CONST.PROYECTOR_COEF_DOSIS[tipo];
+            if (coefFC) estado.FC = (estado.FC || 0) + coefFC.dFC * (gramos / V);
+            return;
+          }
+        } catch (e) {
+          console.warn('[Proyector] calcDeltaPhPorDosificacion falló, fallback lineal:', e.message);
+        }
+      }
+
+      // ── Fallback lineal (deuda D1) ──
+      const coef = this.CONST.PROYECTOR_COEF_DOSIS[tipo];
+      if (!coef) return;
+      const dosis = gramos / V;
+      estado.pH  = estado.pH  + coef.dpH  * dosis;
+      estado.FC  = (estado.FC || 0) + coef.dFC  * dosis;
+      estado.CYA = estado.CYA + coef.dCYA * dosis;
+      estado.ALK = Math.max(0, estado.ALK + coef.dALK * dosis);
+      return;
+    }
+
+    // ───── LLUVIA ─────
+    // Sección 14.3.2(b): dilución uniforme por porcentaje de volumen.
+    if (tipo === 'lluvia') {
+      const fraccion = parseFloat(evento.volumen_pct || 0) / 100;
+      if (fraccion <= 0 || fraccion > 1) return;
+
+      const pH_lluvia  = 5.6;   // CO₂ atmosférico, lluvia limpia
+      const ALK_lluvia = this.CONST.PROYECTOR_LLUVIA_ALK_PPM;
+
+      // Mezcla de pH por concentración de H⁺ (no promedio aritmético)
+      const Hpool   = Math.pow(10, -estado.pH);
+      const Hlluvia = Math.pow(10, -pH_lluvia);
+      const Hmix    = (Hpool * (1 - fraccion)) + (Hlluvia * fraccion);
+      estado.pH     = -Math.log10(Hmix);
+
+      // Dilución lineal de iones
+      estado.ALK = estado.ALK * (1 - fraccion) + ALK_lluvia * fraccion;
+      estado.CH  = estado.CH  * (1 - fraccion);
+      estado.CYA = estado.CYA * (1 - fraccion);
+      estado.FC  = (estado.FC || 0) * (1 - fraccion);
+      estado.TDS = (estado.TDS || 0) * (1 - fraccion);
+      return;
+    }
+
+    // ───── RETROLAVADO ─────
+    // Sección 14.3.2(c): dilución por reemplazo de agua.
+    if (tipo === 'retrolavado') {
+      const pct = parseFloat(evento.volumen_pct || this.CONST.PROYECTOR_RETROLAVADO_PCT_DEFAULT);
+      const fraccion = Math.max(0, Math.min(15, pct)) / 100;
+      if (fraccion <= 0) return;
+
+      // Agua de reposición típica municipal Veracruz
+      const pH_rep  = parseFloat(evento.pH_reposicion  || 7.5);
+      const ALK_rep = parseFloat(evento.ALK_reposicion || 80);
+      const CH_rep  = parseFloat(evento.CH_reposicion  || 150);
+
+      const Hpool = Math.pow(10, -estado.pH);
+      const Hrep  = Math.pow(10, -pH_rep);
+      const Hmix  = (Hpool * (1 - fraccion)) + (Hrep * fraccion);
+      estado.pH   = -Math.log10(Hmix);
+
+      estado.ALK = estado.ALK * (1 - fraccion) + ALK_rep * fraccion;
+      estado.CH  = estado.CH  * (1 - fraccion) + CH_rep  * fraccion;
+      estado.CYA = estado.CYA * (1 - fraccion);
+      estado.FC  = (estado.FC || 0) * (1 - fraccion);
+      estado.TDS = (estado.TDS || 0) * (1 - fraccion);
+      return;
+    }
+
+    // Eventos no reconocidos: silenciosamente ignorados (Sección 14.5)
+  },
+
+  // ━━━ FIN P.3 ━━━
+```
+
+---
+
+## P.4 — Generador de recomendación
+
+Pegar después del bloque P.3:
+
+```js
+  // ━━━ INICIO P.4 — Recomendación operativa del proyector v16.7.0 ━━━
+
+  /**
+   * Genera la recomendación operativa en lenguaje técnico para Omar.
+   * Sección 14.8.1 del Códyce.
+   * @param {object|null} alerta_salida
+   * @param {object} zona
+   * @param {number} horizonte_h
+   * @param {string} regimen
+   * @returns {string}
+   */
+  _proyectorRecomendacion(alerta_salida, zona, horizonte_h, regimen) {
+    if (!alerta_salida) {
+      return 'Agua estable dentro de la zona de seguridad ISPB (' +
+        zona.min.toFixed(2) + ' a ' + zona.max.toFixed(2) +
+        ') durante el horizonte de ' + horizonte_h + ' h. ' +
+        'Mantener régimen actual (' + regimen + ') y dosificación rutinaria.';
+    }
+
+    const h         = alerta_salida.hora;
+    const ispb      = alerta_salida.ISPB_en_cruce;
+    const direccion = alerta_salida.direccion;
+
+    if (direccion === 'incrustante') {
+      return 'ALERTA: el ISPB cruzará la zona segura por el lado INCRUSTANTE ' +
+        'en h+' + h + ' (ISPB ' + ispb.toFixed(2) + '). ' +
+        'Recomendación: aplicar pH Menos Klaren o ácido muriático preventivo ' +
+        (h <= 24 ? 'HOY mismo' : 'antes de h+' + Math.max(1, h - 12)) +
+        '. Si el régimen es cascada/spa, considerar reducir aireación.';
+    } else {
+      return 'ALERTA: el ISPB cruzará la zona segura por el lado CORROSIVO ' +
+        'en h+' + h + ' (ISPB ' + ispb.toFixed(2) + '). ' +
+        'Recomendación: subir alcalinidad con Alkalin Spin y/o dureza con ' +
+        'Cloruro de Calcio antes de h+' + Math.max(1, h - 12) + '.';
+    }
+  },
+
+  // ━━━ FIN P.4 ━━━
+```
+
+---
+
+## P.5 — Función pública `proyectarISPB`
+
+Pegar después del bloque P.4. **Esta es la función principal.**
+
+Estructura de retorno alineada al pie de la letra con la Sección 14.6 del Códyce.
+
+```js
+  // ━━━ INICIO P.5 — Función pública proyectarISPB v16.7.0 ━━━
+
+  /**
+   * Proyecta la evolución del ISPB en el tiempo bajo desgasificación
+   * natural, evaporación y eventos programados. Integración Euler
+   * con paso de 1 h. Sección 14 del Códyce.
+   *
+   * @param {object} estadoInicial - {pH, ALK, CH, CYA, TDS, FC,
+   *   temperatura, recubrimiento, profundidad, regimen_aireacion,
+   *   evaporacion_mm_dia, volumen_m3, modo_operativo}
+   * @param {number} horizonte_h - horas a proyectar (1..168)
+   * @param {Array}  eventos - [{hora, tipo, ...payload}]
+   * @param {object} opciones - {forzar:bool}
+   * @returns {object} estructura doctrinal Sección 14.6
+   */
+  proyectarISPB(estadoInicial, horizonte_h, eventos, opciones) {
+    const opts = opciones || {};
+
+    // ───── 1. VALIDACIÓN DE INPUTS ─────
+    if (!estadoInicial || typeof estadoInicial !== 'object') {
+      return { error: true, mensaje: 'estadoInicial requerido (objeto).' };
+    }
+    const requeridos = ['pH', 'ALK', 'CH', 'temperatura', 'volumen_m3'];
+    for (const k of requeridos) {
+      if (estadoInicial[k] === undefined || estadoInicial[k] === null) {
+        return { error: true, mensaje: 'Campo requerido faltante: ' + k };
+      }
+    }
+
+    let H = parseInt(horizonte_h, 10);
+    if (isNaN(H) || H < 1) H = 24;
+    if (H > this.CONST.PROYECTOR_HORIZONTE_MAX) {
+      H = this.CONST.PROYECTOR_HORIZONTE_MAX;
+    }
+
+    // ───── 2. MODO OPERATIVO PROHIBIDO ─────
+    // Sección 14.8.3 del Códyce.
+    const modo = String(estadoInicial.modo_operativo || 'rutinario').toLowerCase();
+    if (this.CONST.PROYECTOR_MODOS_PROHIBIDOS.indexOf(modo) !== -1 && !opts.forzar) {
+      return {
+        error: true,
+        bloqueado: true,
+        mensaje: 'Proyección bloqueada: modo "' + modo + '" no admite proyección ' +
+                 '(usar opciones.forzar=true bajo responsabilidad del técnico).'
+      };
+    }
+
+    // ───── 3. RÉGIMEN DE AIREACIÓN ─────
+    const regimen = String(estadoInicial.regimen_aireacion || 'filtracion').toLowerCase();
+    const velBase = this.CONST.DESGASIFICACION_VEL_BASE[regimen];
+    if (velBase === undefined) {
+      return { error: true, mensaje: 'regimen_aireacion no reconocido: ' + regimen };
+    }
+
+    // ───── 4. ZONA DE RECUBRIMIENTO ─────
+    const zona = this._zonaSeguridadRecubrimiento(estadoInicial.recubrimiento);
+
+    // ───── 5. ADVERTENCIAS NO BLOQUEANTES ─────
+    const advertencias = [];
+    if ((estadoInicial.CYA || 0) > 75) {
+      advertencias.push('CYA elevado (' + estadoInicial.CYA +
+        ' ppm): Sección 14.8.3(d) recomienda retrolavado/dilución previa.');
+    }
+
+    // ───── 6. ESTADO DE TRABAJO ─────
+    const estado = {
+      pH:          parseFloat(estadoInicial.pH),
+      ALK:         parseFloat(estadoInicial.ALK),
+      CH:          parseFloat(estadoInicial.CH),
+      CYA:         parseFloat(estadoInicial.CYA || 0),
+      TDS:         parseFloat(estadoInicial.TDS || 0),
+      FC:          parseFloat(estadoInicial.FC  || 0),
+      temperatura: parseFloat(estadoInicial.temperatura),
+      profundidad: parseFloat(estadoInicial.profundidad || 1.5)
+    };
+    const V_m3      = parseFloat(estadoInicial.volumen_m3);
+    const evapMmDia = parseFloat(estadoInicial.evaporacion_mm_dia ||
+                                 this.CONST.EVAPORACION_MM_DIA_DEFAULT);
+
+    // F_T constante en el horizonte (Sección 14.4: justificación doctrinal)
+    const F_T = this._factorTemp(estado.temperatura);
+
+    // ───── 7. INDEXAR EVENTOS POR HORA ─────
+    const eventosPorHora = {};
+    if (Array.isArray(eventos)) {
+      for (const ev of eventos) {
+        const h = parseInt(ev.hora, 10);
+        if (!isNaN(h) && h >= 0 && h <= H) {
+          if (!eventosPorHora[h]) eventosPorHora[h] = [];
+          eventosPorHora[h].push(ev);
+        }
+      }
+    }
+
+    // ───── 8. PUNTO INICIAL ─────
+    this._recalcularPHsProyector(estado, F_T);
+    const ispb_inicial = estado.ispb;
+    const en_zona_ini  = (ispb_inicial >= zona.min && ispb_inicial <= zona.max);
+
+    const curva = [];
+    curva.push({
+      h:                0,
+      pH:               parseFloat(estado.pH.toFixed(3)),
+      T_agua:           estado.temperatura,
+      ALK:              parseFloat(estado.ALK.toFixed(1)),
+      ALK_corr:         estado.alkCorr,
+      CH:               parseFloat(estado.CH.toFixed(1)),
+      CYA:              parseFloat(estado.CYA.toFixed(1)),
+      TDS:              parseFloat((estado.TDS || 0).toFixed(0)),
+      pHs:              estado.pHs,
+      ISPB:             estado.ispb,
+      en_zona:          en_zona_ini,
+      factor_wojtowicz: estado.wojtowicz_factor
+    });
+
+    // ───── 9. INTEGRACIÓN EULER ─────
+    let alerta_salida = null;
+    const racha_fuera = [];
+
+    for (let h = 1; h <= H; h++) {
+      // 9.1 Desgasificación con techo suavizado
+      const techo = this._techoSuavizadoDesgasificacion(estado.pH);
+      estado.pH = estado.pH + velBase * techo;
+
+      // 9.2 Evaporación (concentra iones)
+      const fEvap = this._evaporacionFactorHora(estado.profundidad, evapMmDia);
+      estado.ALK = estado.ALK * fEvap;
+      estado.CH  = estado.CH  * fEvap;
+      estado.CYA = estado.CYA * fEvap;
+      estado.TDS = (estado.TDS || 0) * fEvap;
+
+      // 9.3 Eventos programados a esta hora
+      if (eventosPorHora[h]) {
+        for (const ev of eventosPorHora[h]) {
+          this._aplicarEventoProyector(estado, ev, V_m3);
+        }
+      }
+
+      // 9.4 Clamp físico
+      if (this.CONST.PH_FISICO_MIN !== undefined) {
+        if (estado.pH < this.CONST.PH_FISICO_MIN) estado.pH = this.CONST.PH_FISICO_MIN;
+        if (estado.pH > this.CONST.PH_FISICO_MAX) estado.pH = this.CONST.PH_FISICO_MAX;
+      } else {
+        if (estado.pH < 4) estado.pH = 4;
+        if (estado.pH > 11) estado.pH = 11;
+      }
+      if (estado.ALK < 1) estado.ALK = 1;
+      if (estado.CH  < 1) estado.CH  = 1;
+      if (estado.CYA < 0) estado.CYA = 0;
+      if (estado.FC  < 0) estado.FC  = 0;
+
+      // 9.5 Recalcular pHs / ISPB
+      this._recalcularPHsProyector(estado, F_T);
+
+      // 9.6 Detección de cruce con confirmación de 3 puntos
+      // Sección 14.2.3 del Códyce.
+      const fueraIncr = estado.ispb > zona.max;
+      const fueraCorr = estado.ispb < zona.min;
+      const en_zona   = !(fueraIncr || fueraCorr);
+
+      if (!en_zona) {
+        racha_fuera.push({
+          hora:      h,
+          ispb:      estado.ispb,
+          direccion: fueraIncr ? 'incrustante' : 'corrosivo',
+          umbral:    fueraIncr ? zona.max : zona.min
+        });
+        if (racha_fuera.length >= this.CONST.PROYECTOR_PUNTOS_CRUCE_CONFIRMACION &&
+            !alerta_salida) {
+          // Primer punto de la racha = inicio oficial del cruce
+          const inicio = racha_fuera[racha_fuera.length -
+                                     this.CONST.PROYECTOR_PUNTOS_CRUCE_CONFIRMACION];
+          alerta_salida = {
+            hora:           inicio.hora,
+            direccion:      inicio.direccion,
+            ISPB_en_cruce:  parseFloat(inicio.ispb.toFixed(3)),
+            magnitud_cruce: parseFloat(Math.abs(inicio.ispb - inicio.umbral).toFixed(3)),
+            umbral_violado: inicio.umbral
+          };
+        }
+      } else {
+        racha_fuera.length = 0; // se rompió la racha
+      }
+
+      // 9.7 Añadir punto a la curva
+      curva.push({
+        h:                h,
+        pH:               parseFloat(estado.pH.toFixed(3)),
+        T_agua:           estado.temperatura,
+        ALK:              parseFloat(estado.ALK.toFixed(1)),
+        ALK_corr:         estado.alkCorr,
+        CH:               parseFloat(estado.CH.toFixed(1)),
+        CYA:              parseFloat(estado.CYA.toFixed(1)),
+        TDS:              parseFloat((estado.TDS || 0).toFixed(0)),
+        pHs:              estado.pHs,
+        ISPB:             estado.ispb,
+        en_zona:          en_zona,
+        factor_wojtowicz: estado.wojtowicz_factor
+      });
+    }
+
+    // ───── 10. RESUMEN A HORAS CLAVE ─────
+    // Sección 14.6 del Códyce.
+    const horasResumen = [0, 24, 48, 72].filter(h => h <= H);
+    const resumen = {};
+    horasResumen.forEach((h) => {
+      if (curva[h]) {
+        resumen['h' + (h === 0 ? '0' : h)] = {
+          ISPB:    curva[h].ISPB,
+          en_zona: curva[h].en_zona
+        };
+      }
+    });
+    // Renombrar h0 -> t0 por convención doctrinal
+    if (resumen.h0) { resumen.t0 = resumen.h0; delete resumen.h0; }
+
+    // ───── 11. RECOMENDACIÓN ─────
+    const recomendacion = this._proyectorRecomendacion(
+      alerta_salida, zona, H, regimen
+    );
+
+    // ───── 12. RETORNO ESTRUCTURADO (Sección 14.6) ─────
+    return {
+      version:           '16.7.0',
+      estadoInicial: {
+        pH:            estadoInicial.pH,
+        ISPB:          ispb_inicial,
+        recubrimiento: zona.recubrimiento
+      },
+      horizonte_h:        H,
+      regimen_aireacion:  regimen,
+      curva:              curva,
+      resumen:            resumen,
+      alerta_salida:      alerta_salida,
+      recomendacion:      recomendacion,
+      zona_recubrimiento: { min: zona.min, max: zona.max },
+      advertencias:       advertencias,
+      integracion_F:      (typeof this.calcDeltaPhPorDosificacion === 'function'),
+      firma:              this.CONST.FIRMA
+    };
+  },
+
+  // ━━━ FIN P.5 ━━━
+```
+
+---
+
+## P.6 — Suite de tests `TESTS_PROYECTOR_V17_8`
+
+**6 casos doctrinales** según Sección 14.10 (V1). Test 3 blindado contra fallo en cascada.
+
+Pegar **fuera del objeto `Chemistry`**, al final del archivo (antes del bloque de export P.7):
+
+```js
+// ━━━ INICIO P.6 — Suite de tests del Proyector v16.7.0 ━━━
+// Sección 14.10 del Códyce — Criterio de promoción: 6/6 verde.
+
+const TESTS_PROYECTOR_V17_8 = [
+
+  // T_PROJ_01 — Estabilidad en reposo sin eventos
+  {
+    id: 'T_PROJ_01',
+    descripcion: 'Estabilidad en reposo sin eventos: ISPB no cruza zona en 48 h.',
+    input: {
+      estadoInicial: {
+        pH: 7.40, ALK: 100, CH: 300, CYA: 40, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'reposo', volumen_m3: 50
+      },
+      horizonte_h: 48, eventos: []
+    },
+    esperado: (r) => r.alerta_salida === null
+  },
+
+  // T_PROJ_02 — Cruce incrustante por cascada
+  {
+    id: 'T_PROJ_02',
+    descripcion: 'Cascada eleva pH hasta cruzar zona incrustante.',
+    input: {
+      estadoInicial: {
+        pH: 7.80, ALK: 110, CH: 350, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'cascada', volumen_m3: 50
+      },
+      horizonte_h: 48, eventos: []
+    },
+    esperado: (r) => r.alerta_salida && r.alerta_salida.direccion === 'incrustante'
+  },
+
+  // T_PROJ_03 — Dosis ácida retrasa o evita cruce
+  // BLINDADO: protegido contra baseline nulo.
+  {
+    id: 'T_PROJ_03',
+    descripcion: 'Dosis de bisulfato a h=12 retrasa o evita cruce de zona.',
+    input: {
+      estadoInicial: {
+        pH: 7.80, ALK: 110, CH: 350, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'cascada', volumen_m3: 50
+      },
+      horizonte_h: 48,
+      eventos: [{ hora: 12, tipo: 'dosis_bisulfato_klaren', cantidad_g: 1500 }]
+    },
+    esperado: (r, baseline) => {
+      // Sin baseline disponible: aceptar si no hay alerta o si llega después de h=24
+      if (!baseline || baseline.error || !baseline.alerta_salida) {
+        return !r.alerta_salida || r.alerta_salida.hora > 24;
+      }
+      // Con baseline: la dosis debe evitar el cruce o retrasarlo
+      return !r.alerta_salida || r.alerta_salida.hora > baseline.alerta_salida.hora;
+    }
+  },
+
+  // T_PROJ_04 — Suavizado de techo
+  {
+    id: 'T_PROJ_04',
+    descripcion: 'Aún con cascada 168 h, pH se asintota debajo de 8.5.',
+    input: {
+      estadoInicial: {
+        pH: 7.90, ALK: 120, CH: 350, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'cascada', volumen_m3: 50
+      },
+      horizonte_h: 168, eventos: []
+    },
+    esperado: (r) => r.curva[r.curva.length - 1].pH < 8.5
+  },
+
+  // T_PROJ_05 — Dependencia de recubrimiento
+  {
+    id: 'T_PROJ_05',
+    descripcion: 'Recubrimiento fibra es más estricto que pebble.',
+    input: {
+      estadoInicial: {
+        pH: 7.60, ALK: 100, CH: 320, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'fibra', profundidad: 1.5,
+        regimen_aireacion: 'filtracion', volumen_m3: 50
+      },
+      horizonte_h: 72, eventos: []
+    },
+    esperado: (r) => r.zona_recubrimiento.max === 0.10
+  },
+
+  // T_PROJ_06 — Estructura de la curva
+  {
+    id: 'T_PROJ_06',
+    descripcion: 'Curva tiene horizonte_h+1 puntos y campos completos doctrinales.',
+    input: {
+      estadoInicial: {
+        pH: 7.40, ALK: 100, CH: 300, CYA: 40, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'filtracion', volumen_m3: 50
+      },
+      horizonte_h: 24, eventos: []
+    },
+    esperado: (r) => {
+      if (r.curva.length !== 25) return false;
+      const punto = r.curva[12];
+      return typeof punto.pH               === 'number' &&
+             typeof punto.ISPB             === 'number' &&
+             typeof punto.ALK              === 'number' &&
+             typeof punto.ALK_corr         === 'number' &&
+             typeof punto.pHs              === 'number' &&
+             typeof punto.en_zona          === 'boolean' &&
+             typeof punto.factor_wojtowicz === 'number';
+    }
+  }
+];
+
+function ejecutarTestsProyector() {
+  const resultados = [];
+  let pasados = 0, fallados = 0;
+
+  // Baseline para T_PROJ_03: ejecutar T_PROJ_02 primero (sin dosis)
+  let baseline = null;
+  try {
+    const tBase = TESTS_PROYECTOR_V17_8.find(t => t.id === 'T_PROJ_02');
+    if (tBase) baseline = Chemistry.proyectarISPB(
+      tBase.input.estadoInicial, tBase.input.horizonte_h, tBase.input.eventos
+    );
+  } catch (e) {
+    baseline = null;
+  }
+
+  for (const t of TESTS_PROYECTOR_V17_8) {
+    try {
+      const r = Chemistry.proyectarISPB(
+        t.input.estadoInicial, t.input.horizonte_h, t.input.eventos
+      );
+      const ok = !!t.esperado(r, baseline);
+      resultados.push({ id: t.id, descripcion: t.descripcion, pasado: ok });
+      if (ok) pasados++; else fallados++;
+    } catch (e) {
+      resultados.push({
+        id: t.id, descripcion: t.descripcion, pasado: false,
+        error: e.message
+      });
+      fallados++;
+    }
+  }
+
+  const reporte = {
+    total:    TESTS_PROYECTOR_V17_8.length,
+    pasados:  pasados,
+    fallados: fallados,
+    veredicto: (fallados === 0)
+                 ? '✅ 6/6 VERDE — listo para validación retrospectiva (V2)'
+                 : '❌ Hay tests fallando — NO promover',
+    detalle:  resultados
+  };
+
+  console.log('[Proyector v16.7.0] Tests:', reporte.veredicto);
+  if (typeof console.table === 'function') console.table(resultados);
+  return reporte;
+}
+
+// Exponer al objeto Chemistry para invocación uniforme
+Chemistry.ejecutarTestsProyector = ejecutarTestsProyector;
+
+// ━━━ FIN P.6 ━━━
+```
+
+---
+
+## P.7 — Export Node/CommonJS
+
+Pegar **al final del archivo**, después de P.6:
+
+```js
+// ━━━ INICIO P.7 — Export Node/CommonJS v16.7.0 ━━━
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = Chemistry;
+  module.exports.proyectarISPB           = Chemistry.proyectarISPB.bind(Chemistry);
+  module.exports.TESTS_PROYECTOR_V17_8   = TESTS_PROYECTOR_V17_8;
+  module.exports.ejecutarTestsProyector  = ejecutarTestsProyector;
+}
+
+if (typeof window !== 'undefined') {
+  window.Chemistry = Chemistry;
+}
+
+// ━━━ FIN P.7 ━━━
+```
+
+---
+
+## Checklist de integración desde GitHub móvil
+
+1. Verifica que `chemistry.js` esté en versión 16.6.0 base (sin Wojtowicz aún integrado). Si ya integraste PASO 1 antes, salta al paso 4.
+
+2. Aplica primero el **PASO 1 — Refactor de calcISV con Wojtowicz dinámica** (documento separado en el repo). Esto agrega `WOJTOWICZ_TABLA`, `_factorWojtowicz()`, y modifica `calcISV`.
+
+3. Verifica que después del PASO 1 el archivo tenga `VERSION: '16.7.0'` y un nuevo método `_factorWojtowicz`.
+
+4. Actualiza la cabecera del archivo según el **PASO 0** de este documento (cambiar bloque de comentarios y mantener `VERSION: '16.7.0'`).
+
+5. Inyecta el bloque **P.1** dentro de `Chemistry.CONST`, tras `WOJTOWICZ_TABLA`.
+
+6. Inyecta **P.2**, **P.3**, **P.4**, **P.5** como métodos del objeto `Chemistry`, en ese orden, después de `_factorTemp` y `_factorWojtowicz`.
+
+7. Inyecta **P.6** y **P.7** al final del archivo, fuera del objeto `Chemistry`.
+
+8. Commit con mensaje: `feat(chemistry): v16.7.0 - Wojtowicz dinámica + Proyector Temporal del ISPB (Sección 14)`.
+
+9. En la consola del navegador, ejecuta:
+
+```js
+Chemistry.ejecutarTestsProyector();
+```
+
+10. Criterio de promoción V1: **6/6 verde**. Si hay tests rojos, capturar el `console.table` y reabrir caso.
+
+11. Verifica integración dinámica con Entregable F:
+
+```js
+Chemistry.proyectarISPB(
+  {pH:7.4, ALK:100, CH:300, CYA:40, temperatura:28, volumen_m3:50},
+  24, []
+).integracion_F;
+```
+
+Si devuelve `true`, la integración con Sección 13 está activa. Si `false`, opera en fallback lineal (deuda D1).
+
+---
+
+## Invocación típica desde `isaias.js`
+
+```js
+const resultado = Chemistry.proyectarISPB(
+  {
+    pH: 7.62,
+    ALK: 110,
+    CH: 350,
+    CYA: 45,
+    TDS: 1300,
+    FC: 2.5,
+    temperatura: 28.5,
+    recubrimiento: 'porcelanato',
+    profundidad: 1.6,
+    regimen_aireacion: 'cascada',
+    volumen_m3: 60,
+    evaporacion_mm_dia: 5
+  },
+  72,                                                       // horizonte 3 días
+  [
+    { hora: 24, tipo: 'dosis_tricloro',  cantidad_g: 200 },
+    { hora: 36, tipo: 'lluvia',          volumen_pct: 1.5 }
+  ],
+  {}
+);
+
+// Inspeccionar resultado según Sección 14.6
+console.log('ISPB t0:',  resultado.resumen.t0.ISPB);
+console.log('ISPB h24:', resultado.resumen.h24.ISPB);
+console.log('ISPB h48:', resultado.resumen.h48.ISPB);
+console.log('ISPB h72:', resultado.resumen.h72.ISPB);
+
+if (resultado.alerta_salida) {
+  console.log('Cruce en h+' + resultado.alerta_salida.hora +
+              ' hacia ' + resultado.alerta_salida.direccion);
+  EventBus.dispatch('proyector_alerta', resultado);
+}
+
+console.log(resultado.recomendacion);
+```
+
+---
+
+## Deudas técnicas declaradas
+
+**D1 — Aproximación lineal en eventos de dosis.**
+`_aplicarEventoProyector` usa coeficientes lineales de `CONST.PROYECTOR_COEF_DOSIS` como fallback. La integración con `calcDeltaPhPorDosificacion` (Sección 13) es automática si la función está disponible. Cerrar cuando V2 (validación retrospectiva) y V3 (validación prospectiva) sean verdes en ≥5 clientes con error medio absoluto ≤0.10 ISPB.
+
+**D2 — Zonas de recubrimiento duplicadas.**
+`ZONAS_RECUBRIMIENTO` está en `Chemistry.CONST` y también hardcodeada dentro de `calcISV`. Cirugía menor pendiente: refactorizar `calcISV` para que consuma `this.CONST.ZONAS_RECUBRIMIENTO`. Sin cambio de comportamiento.
+
+**D3 — Temperatura constante durante el horizonte.**
+Decisión doctrinal blindada (Sección 14.4). v2 del proyector podrá incorporar `T(t)` variable cuando exista bitácora histórica suficiente y acoplamiento con `clima.js`.
+
+**D4 — Velocidad de desgasificación nominal.**
+`DESGASIFICACION_VEL_BASE` es punto medio de banda empírica (Sección 12.4 del Códyce). Banda real ±50%. Calibración kLa por cliente diferido a v2 con bitácora histórica.
+
+---
+
+## Criterios de promoción a producción
+
+**V1 — Suite unitaria.**
+`Chemistry.ejecutarTestsProyector()` devuelve **6/6 verde**. Cubre estabilidad, cruce incrustante, retraso por dosis, suavizado de techo, dependencia de recubrimiento, estructura de curva.
+
+**V2 — Validación retrospectiva.**
+Para cada uno de los ≥5 clientes activos: tomar lectura de hace 72 h con eventos reales registrados, proyectar, comparar contra lectura actual real. Criterio: error medio absoluto en ISPB final ≤0.10 unidades en ≥5/6 clientes.
+
+**V3 — Validación prospectiva.**
+Proyectar hoy a 48 h, esperar 48 h, comparar contra lectura real. Mismo criterio que V2.
+
+**V4 — Dependencia satisfecha.**
+`calcDeltaPhPorDosificacion` (Sección 13 / Entregable F) inyectada en `chemistry.js`. Hasta entonces, el proyector opera en modo fallback lineal (campo `integracion_F: false`) y los resultados son operativos pero no rigurosos.
+
+**Promoción final:** V1, V2, V3 y V4 verdes simultáneamente. Hasta entonces, la facultad permanece en modo satélite con marca de "calibración pendiente".
+
+---
+
+## Cierre
+
+Este entregable completa la implementación blindada de la Sección 14 del CÓDYCE NEXUS V17.8. La nomenclatura, estructura de retorno, suite de tests y deudas técnicas están alineadas al pie de la letra con la doctrina.
+
+**Firma autor:** Omar Alberto Valle Mercado · RFC VAMO870509HW3
+**Pool Balance — Gestoría Hídrica Profesional**
+**Mayo 2026**
