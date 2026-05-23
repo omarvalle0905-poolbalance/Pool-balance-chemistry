@@ -1,0 +1,641 @@
+══════════════════════════════════════════════════════════════
+SECCIÓN 14 — PROYECTOR TEMPORAL DEL ISPB
+Facultad de Predicción Termodinámica a Horizonte Operativo
+═══════════════════════════════════════════════════════════════
+
+Versión: 14.0 (inaugural)
+Implementación: chemistry.js v16.7.0, método proyectarISPB()
+Estatus: Doctrina blindada · Pendiente calibración empírica de campo
+Prerequisito termodinámico: Sección 4.1.1 (Wojtowicz dinámico, 
+implementado en v16.7.0 como _factorWojtowicz)
+
+
+14.1. PROPÓSITO Y JUSTIFICACIÓN DOCTRINAL
+
+El ISPB de la Sección 4 es una FOTOGRAFÍA: dado un estado físico-
+químico instantáneo, retorna el índice de saturación en ese 
+momento. Esta facultad responde la pregunta "¿cómo está el agua 
+ahora?".
+
+Operativamente, Pool Balance necesita responder una pregunta 
+distinta y más valiosa: "¿cuándo va a salir de zona si no 
+intervengo?". Esa pregunta exige PELÍCULA, no foto. Exige modelar 
+la deriva en el tiempo de las variables que alimentan al pHs, 
+detectar el cruce del umbral de la zona de seguridad del 
+recubrimiento, y entregar al técnico una hora exacta de 
+intervención recomendada.
+
+El Proyector Temporal del ISPB es esa facultad. No es un índice 
+nuevo; es la dimensión temporal del índice existente. No agrega 
+métricas que puedan contradecir al ISPB (rechazo doctrinal del 
+Ryznar, registrado en histórico de auditoría V17.8). Agrega 
+horizonte.
+
+Caso de uso canónico: Isaías recibe la lectura de la alberca del 
+cliente Carranza un lunes al mediodía. ISPB actual = +0.18 
+(dentro de zona porcelanato). Sin proyector, Isaías reporta 
+"agua en equilibrio, próxima revisión el viernes". Con proyector, 
+Isaías ejecuta proyectarISPB() y descubre que la combinación de 
+desgasificación leve por filtración continua + evaporación 
+veracruzana lleva al ISPB a +0.31 en 58 horas, cruzando el 
+umbral superior de porcelanato. Reporta: "Agua estable hoy, pero 
+cruza zona incrustante el miércoles por la tarde. Programar 
+intervención el miércoles 10 AM con 150 mL de ácido muriático 
+para resetear el horizonte a 72h limpios".
+
+
+14.2. BASES TEÓRICAS DE LA INTEGRACIÓN
+
+14.2.1. Método numérico elegido: Euler explícito de primer orden
+
+La ecuación general de evolución del estado del sistema es:
+
+  dE/dt = f(E, eventos, ambiente, t)
+
+Donde E es el vector de estado [pH, ALK, CH, CYA, TDS], f es la 
+función de deriva que combina desgasificación, dosificaciones, 
+eventos meteorológicos y evaporación.
+
+Pool Balance integra esta EDO por método de Euler explícito con 
+paso fijo Δt = 1 hora:
+
+  E(h+1) = E(h) + f(E(h), eventos[h], ambiente[h]) × Δt
+
+Justificación de la elección de Euler sobre métodos superiores 
+(Runge-Kutta 4, Adams-Bashforth, etc.):
+
+(a) La dinámica del agua de alberca es de constantes de tiempo 
+LARGAS comparadas con el paso de integración. La velocidad de 
+desgasificación más agresiva del sistema (spa_venturi = 0.150 
+ΔpH/h) está dos órdenes de magnitud por debajo de cualquier 
+inestabilidad numérica de Euler. No hay rigidez que justifique 
+métodos implícitos.
+
+(b) Los eventos de mayor impacto (dosificaciones químicas) son 
+DISCRETOS, no continuos. Un método de orden superior interpolaría 
+sobre saltos artificiales y empeoraría la precisión local en el 
+instante del evento. Euler con paso de 1h preserva la 
+discontinuidad física real.
+
+(c) La incertidumbre de los insumos empíricos (kLa estimado, 
+evaporación promediada, coeficientes ν aproximados) supera 
+ampliamente el error de truncamiento del método. Refinar el 
+integrador es optimizar lo que no domina el error total.
+
+(d) Auditabilidad: Euler es trivialmente verificable a mano por 
+el operador en campo. Cualquier paso de la integración puede 
+reconstruirse con calculadora. Esta propiedad es no negociable 
+en Pool Balance.
+
+14.2.2. Paso de integración Δt = 1 hora
+
+Tres razones convergen al paso horario:
+
+Primera, RESOLUCIÓN DE EVENTOS. Las dosificaciones programadas 
+de campo se planean con resolución horaria ("dosifico mañana a 
+las 10"), no minuto a minuto. Un paso menor sería precisión 
+falsa; un paso mayor (3h, 6h) generaría aliasing sobre eventos 
+discretos que caen entre puntos de muestreo.
+
+Segunda, ESCALA DE LAS DERIVAS DOMINANTES. La desgasificación 
+en régimen de filtración produce ΔpH ≈ 0.015 por hora. Para 
+detectar cruces de zona con resolución de 0.05 unidades ISPB 
+(umbral operativo), basta con muestrear cada 1-3 horas. Una hora 
+da margen.
+
+Tercera, COSTO COMPUTACIONAL. Horizonte de 72h × 1h = 72 
+iteraciones. Cada iteración ejecuta una llamada a 
+_factorWojtowicz, dos log10, y aritmética básica. Tiempo total 
+de ejecución en navegador móvil: <15 ms. Bajar a paso de 15 
+minutos cuadruplicaría el costo sin beneficio operativo medible.
+
+14.2.3. Detección de cruce con confirmación de 3 puntos
+
+El proyector NO dispara alerta_salida en el primer punto que 
+detecta ISPB fuera de zona. Espera TRES PUNTOS CONSECUTIVOS 
+fuera, y entonces reporta como hora oficial de cruce el PRIMERO 
+de esos tres.
+
+Justificación: las oscilaciones numéricas pequeñas alrededor 
+del umbral (típicamente ±0.01 ISPB por interpolación lineal 
+de Wojtowicz cerca de puntos tabulados) pueden generar falsos 
+positivos puntuales. La regla de los 3 puntos elimina ruido 
+y preserva señal verdadera.
+
+Si el técnico requiere comportamiento más agresivo (alerta 
+inmediata al primer cruce), el método admite parametrización 
+futura. En v1 la confirmación de 3h es fija y doctrinal.
+
+
+14.3. DERIVA DE CADA VARIABLE — LEYES Y FÓRMULAS
+
+14.3.1. Deriva de pH
+
+El pH es la variable más volátil del sistema y la que más 
+decide el ISPB en horizonte 72h. Tres fuerzas actúan sobre 
+ella simultáneamente:
+
+(a) DESGASIFICACIÓN DE CO₂ (continuo). El agua de alberca 
+contiene CO₂ disuelto en sobresaturación respecto a la 
+atmósfera. Conforme escapa, el equilibrio carbonato-bicarbonato 
+se desplaza liberando OH⁻ libre, subiendo el pH 
+asintóticamente hacia un techo. La velocidad de escape 
+depende del régimen de aireación:
+
+  Régimen              ΔpH/h base
+  ──────────────────────────────
+  reposo                 0.003
+  filtracion             0.015
+  cascada                0.080
+  spa_venturi            0.150
+
+Constante implementada: DESGASIFICACION_VEL_BASE (Sección 
+14.7). Valores derivados de la Sección 12.4 del Códice 
+(Weiss 1974 + calibración Veracruz).
+
+Suavizado por techo: a pH bajo (≤8.0) la velocidad base se 
+aplica íntegra. Entre pH 8.0 y 8.4 la velocidad decae 
+linealmente hasta cero. A pH ≥ 8.4 la velocidad es nula 
+(equilibrio termodinámico con pCO₂ atmosférico).
+
+  factor_techo(pH) = max(0, min(1, (8.4 - pH) / 0.4))
+  ΔpH_desgas(h) = vel_base × factor_techo(pH(h))
+
+Decisión doctrinal: el techo es SUAVIZADO, no abrupto. La 
+versión previa de Pool Balance (v16.6.0) implementaba corte 
+seco en pH = 8.4, generando un codo artificial en la curva 
+ISPB(t) que rompía la continuidad operativa. El suavizado 
+lineal entre 8.0 y 8.4 preserva la física real (el flujo 
+de CO₂ no se detiene de golpe, decae conforme la sobre-
+saturación se acerca a cero).
+
+(b) DOSIFICACIONES PROGRAMADAS (discreto). Cuando el técnico 
+declara una dosis futura en el array eventos, el proyector 
+aplica un SALTO de pH en la hora exacta del evento. No es 
+rampa, es discontinuidad. Magnitud del salto: aproximación 
+lineal en v1 (ver Sección 14.7 — deuda técnica con la 
+facultad V17.8 de impacto ácido-base inmediato, Sección 13). 
+Cuando la facultad 13 se integre como dependencia, el salto 
+pasará a calcularse por calcDeltaPhPorDosificacion con rigor 
+estequiométrico.
+
+(c) DERIVA POR USO (no implementado en v1). Bañistas aportan 
+urea y sudor que generan iones H⁺ vía cloraminación. Efecto 
+pequeño pero acumulativo. Diferido a v2 cuando exista bitácora 
+de uso por cliente (asistencia de bañistas declarada).
+
+14.3.2. Deriva de alcalinidad total (ALK)
+
+Variable cuasi-estable en horizonte 72h salvo eventos discretos. 
+Tres fuentes de cambio modeladas:
+
+(a) Dosificaciones que la afectan: bisulfato Klaren (baja), 
+ácido muriático (baja), bicarbonato Alkalin (sube), hipoclorito 
+sódico NaOCl (sube colateral 1.4 ppm/ppm Cl), tricloro (baja 
+colateral). Todas implementadas como saltos discretos en la 
+hora del evento.
+
+(b) Eventos meteorológicos: lluvia con porcentaje de volumen 
+declarado aplica factor de dilución (1 − pct/100) sobre ALK, 
+CYA, CH y TDS simultáneamente. Modelo conservativo: asume agua 
+de lluvia con ALK = 0, lo cual sobreestima ligeramente la 
+dilución real en zonas costeras (la lluvia veracruzana 
+contiene típicamente 8-15 ppm ALK por aerosol marino), pero 
+el error está dentro del margen del proyector.
+
+(c) Retrolavado: dilución por reemplazo de agua del 5% del 
+volumen por defecto, parametrizable hasta 15%.
+
+14.3.3. Deriva de cianurato (CYA)
+
+Solo cambia por eventos discretos. Tres mecanismos:
+
+(a) Dosificación de tricloro (sube): cada gramo aporta 0.55 g 
+de CYA por la pureza TRICLORO_CIAN_PCT.
+
+(b) Adición directa de ácido cianúrico (sube): 1 g/m³ = 1 ppm.
+
+(c) Lluvia y retrolavado (baja por dilución).
+
+NOTA CRÍTICA: el CYA no se degrada espontáneamente en horizonte 
+72h. Cualquier modelo que prediga decrecimiento natural de CYA 
+en menos de semanas es incorrecto. La degradación real ocurre 
+por hidrólisis bacteriana en filtros con ALK alta y temperatura 
+sostenida, con constantes de tiempo de 30-90 días — fuera del 
+alcance del proyector.
+
+14.3.4. Deriva de dureza cálcica (CH)
+
+Variable casi inmóvil en horizonte 72h. Dos mecanismos:
+
+(a) Concentración por evaporación: CH(h) = CH(h-1) / factor_evap, 
+donde factor_evap = 1 − evap_mm_h/profundidad_mm. Para Veracruz 
+residencial sol regular con profundidad media 1.5 m y 
+evaporación de 4 mm/día, la concentración es del orden de 
+0.27% por día, prácticamente despreciable salvo en CH muy alto 
+preexistente (>400 ppm).
+
+(b) Dosificación de cloruro de calcio o hipoclorito de calcio 
+(sube discreto). Lluvia o retrolavado (baja por dilución).
+
+NO se modela disolución del recubrimiento (caso Carranza, 
+Sección 8.1). Ese fenómeno tiene constante de tiempo de 
+semanas y depende de gradiente de saturación negativo 
+sostenido. Fuera del alcance del proyector horizonte 72h.
+
+14.3.5. Deriva de TDS
+
+Análoga a CH: concentración por evaporación, dilución por 
+lluvia/retrolavado, suma directa por dosificaciones (todas las 
+sales aportan TDS). Su efecto sobre el ISPB es marginal hasta 
+1000 ppm (F_TDS = 0 por debajo). Por encima, contribuye 
+logarítmicamente. En horizonte 72h sin eventos extremos, 
+prácticamente constante.
+
+14.3.6. Recálculo de pHs cada hora
+
+En cada paso del integrador, una vez actualizadas las variables 
+de estado, el proyector recalcula pHs(h) usando exactamente la 
+misma fórmula de calcISV pero con los valores propagados:
+
+  factorWoj(h) = _factorWojtowicz(pH(h))
+  alkCorr(h)   = max(1, ALK(h) − CYA(h) × factorWoj(h))
+  F_CH(h)      = log10(max(1, CH(h)))
+  F_ALK(h)     = log10(alkCorr(h))
+  F_TDS(h)     = 0 si TDS(h) ≤ 1000; 0.1·log10(TDS(h)/1000) si >
+  pHs(h)       = 12.1 + F_TDS(h) − F_T − F_CH(h) − F_ALK(h)
+  ISPB(h)      = pH(h) − pHs(h)
+
+Donde F_T es constante porque la temperatura del agua se 
+asume invariante en el horizonte (Sección 14.4).
+
+El factorWoj se recalcula en cada paso porque depende del pH 
+actual, y el pH cambia. Esta es la razón técnica por la que el 
+refactor Wojtowicz dinámico (v16.7.0) era prerequisito no 
+negociable del proyector: integrar con CYA/3 fija habría 
+introducido sesgo acumulativo de hasta 0.04 pHs al final del 
+horizonte, suficiente para falsear la predicción de cruce.
+
+
+14.4. JUSTIFICACIÓN DE TEMPERATURA CONSTANTE
+
+Decisión doctrinal: durante el horizonte de proyección, la 
+temperatura del agua se ASUME CONSTANTE e igual al valor del 
+estadoInicial. F_T se calcula una sola vez al inicio y se 
+reutiliza en todas las iteraciones.
+
+Esta decisión podría parecer una simplificación agresiva 
+considerando que la temperatura ambiente en Veracruz oscila 
+±5°C entre día y noche. Las razones por las que es defendible 
+operativamente son tres:
+
+(a) INERCIA TÉRMICA DEL CUERPO DE AGUA. Una alberca residencial 
+típica (50 m³) contiene 50,000 kg de agua. Para mover su 
+temperatura 1°C requiere ≈209,000 kJ de energía neta. La 
+radiación solar pico (≈1 kW/m² × 25 m² de espejo × 7 h 
+útiles × eficiencia de absorción 0.7) entrega ≈441,000 kJ por 
+día de absorción bruta, pero la pérdida nocturna por 
+evaporación + radiación infrarroja recupera prácticamente toda 
+esa energía. El resultado neto medido en campo Veracruz: 
+oscilación diurna del agua de ±1.5°C alrededor de un promedio 
+estable estacional.
+
+(b) SENSIBILIDAD DEL pHs A LA TEMPERATURA. El factor F_T en 
+la fórmula Langelier varía 0.02 unidades entre 28°C y 30°C, 
+y 0.04 entre 25°C y 30°C. Una oscilación diurna de ±1.5°C 
+mueve pHs en ±0.03 unidades. Comparado con el sesgo intrínseco 
+de los demás insumos del proyector (kLa, ν aproximados, 
+evaporación promediada), esa variación es ruido, no señal.
+
+(c) AUDITABILIDAD. Permitir T(t) variable obligaría a inyectar 
+serie meteorológica horaria como dependencia del proyector. 
+Eso convierte una facultad determinista y reproducible en una 
+facultad acoplada al estado de clima.js y a la disponibilidad 
+de pronóstico horario fiable. Para v1 — diseñada para correr 
+en campo desde celular bajo sol veracruzano — la simplicidad 
+prima.
+
+Caso límite donde la asunción falla: albercas TECHADAS con 
+calefacción activa o eventos de cambio de estación abrupto 
+(frente frío de noviembre que baja T_aire 10°C en 24h). En 
+ambos casos, recomendación doctrinal: ejecutar el proyector 
+en horizontes cortos (24h) y re-medir antes de re-proyectar. 
+NO extender a 72h ciegamente.
+
+v2 del proyector podrá incorporar T(t) variable cuando exista 
+bitácora histórica suficiente para validar el modelo térmico 
+acoplado contra realidad. Por ahora, T constante es la 
+decisión doctrinal blindada.
+
+
+14.5. ESTRUCTURA DE EVENTOS PROGRAMADOS
+
+El parámetro `eventos` del método proyectarISPB es un array de 
+objetos. Cada objeto representa un evento DISCRETO que ocurre en 
+una hora específica del horizonte. Estructura:
+
+  { hora: <0..horizonte>, tipo: <string>, ...payload }
+
+Tipos soportados en v1.0:
+
+  Tipo                    Payload requerido
+  ──────────────────────────────────────────────
+  dosis_tricloro          cantidad_g
+  dosis_hipo_calcio       cantidad_g
+  dosis_acido_muriatico   cantidad_ml
+  dosis_bisulfato_klaren  cantidad_g
+  dosis_alkalin           cantidad_g
+  lluvia                  volumen_pct
+  retrolavado             volumen_pct (default 5)
+
+Eventos de tipo no reconocido son silenciosamente ignorados (no 
+rompen la proyección). Eventos con hora fuera de rango 
+[0, horizonte] son descartados al indexar.
+
+Reglas operativas para el técnico:
+
+(a) La hora del evento es RELATIVA al inicio de la proyección, 
+no horario absoluto. Si la lectura inicial es a las 12:00 del 
+lunes y el técnico planea dosificar el miércoles a las 10:00, 
+el evento es {hora: 46, tipo: ...}.
+
+(b) Múltiples eventos pueden ocurrir en la misma hora. Se 
+aplican en el orden del array, sin verificación de incompati-
+bilidades químicas. Responsabilidad del técnico verificar que 
+no se programen dosis contradictorias (ej. ácido + bicarbonato 
+en la misma hora).
+
+(c) Los eventos de lluvia esperada se modelan como volumen 
+agregado al sistema, con dilución uniforme. Para tormenta 
+veracruzana típica de 30 mm/h durante 1h en alberca de 50 m³ 
+con espejo 25 m²: aporta 0.75 m³ = 1.5% del volumen → 
+{hora: H, tipo: 'lluvia', volumen_pct: 1.5}.
+
+
+14.6. ESTRUCTURA DEL OBJETO DE RETORNO
+
+El método proyectarISPB retorna un objeto con esta estructura:
+
+  {
+    version: '16.7.0',
+    estadoInicial: { pH, ISPB, recubrimiento },
+    horizonte_h: <número de horas proyectadas>,
+    regimen_aireacion: <régimen activo>,
+    
+    curva: [
+      { h, pH, T_agua, ALK, ALK_corr, CH, CYA, TDS, 
+        pHs, ISPB, en_zona, factor_wojtowicz },
+      ...
+    ],  // longitud = horizonte_h + 1 (incluye t=0)
+    
+    resumen: {
+      t0:  { ISPB, en_zona },
+      h24: { ISPB, en_zona },
+      h48: { ISPB, en_zona },
+      h72: { ISPB, en_zona }
+    },
+    
+    alerta_salida: null | {
+      hora: <primera hora de cruce confirmado>,
+      direccion: 'incrustante' | 'corrosivo',
+      ISPB_en_cruce: <valor>,
+      magnitud_cruce: <distancia al umbral>,
+      umbral_violado: <valor del umbral>
+    },
+    
+    recomendacion: <string operativo para Isaías>,
+    zona_recubrimiento: { min, max }
+  }
+
+Reglas de interpretación:
+
+(a) Si alerta_salida es null, la alberca PERMANECE EN ZONA todo 
+el horizonte. La recomendación será de revisión rutinaria.
+
+(b) Si alerta_salida.hora existe, ese valor es la primera hora 
+del cruce CONFIRMADO (tras 3 puntos consecutivos fuera). La 
+intervención debe programarse ANTES de esa hora, no en ella.
+
+(c) magnitud_cruce indica qué tan profundo entró el ISPB fuera 
+de zona en el punto de cruce. Valores >0.10 indican deriva 
+agresiva que requiere intervención químicamente significativa, 
+no solo correctiva.
+
+
+14.7. CONSTANTES IMPLEMENTADAS Y DEUDA TÉCNICA
+
+Tabla de constantes del Proyector, todas en chemistry.js v16.7.0:
+
+  Constante                           Valor           Fuente
+  ──────────────────────────────────────────────────────────────
+  DESGASIFICACION_VEL_BASE.reposo     0.003 ΔpH/h    Códice 12.4
+  DESGASIFICACION_VEL_BASE.filtracion 0.015 ΔpH/h    Códice 12.4
+  DESGASIFICACION_VEL_BASE.cascada    0.080 ΔpH/h    Códice 12.4
+  DESGASIFICACION_VEL_BASE.spa_venturi 0.150 ΔpH/h   Códice 12.4
+  PH_EQUILIBRIO_TECHO                 8.4            calibrado motor
+  PH_INICIO_DECAIMIENTO               8.0            doctrina v17.8
+  EVAPORACION_MM_DIA_DEFAULT          4.0 mm/día     Veracruz costero
+  PROYECTOR_PASO_HORAS                1              decisión 14.2.2
+  PROYECTOR_HORIZONTE_MAX             168 (7 días)   hard-stop defensivo
+
+DEUDAS TÉCNICAS DECLARADAS (v1.0):
+
+(D1) Los coeficientes ΔpH de cada tipo de dosis en 
+_aplicarEventoProyector son APROXIMACIONES LINEALES. La fórmula 
+correcta es la facultad de impacto ácido-base inmediato 
+documentada en la Sección 13 del Códice (calcDeltaPhPorDosificacion). 
+Cuando la Sección 13 se integre como dependencia del proyector, 
+cada case del switch interno pasará a invocarla. Pendiente 
+declarado al cierre del Changelog de salida (sesión Pool 
+Balance / Célula Satélite Gemini, 11 de mayo de 2026).
+
+(D2) La constante DESGASIFICACION_VEL_BASE para cada régimen 
+es un punto medio de la banda empírica de la Sección 12.4. La 
+banda real es ±50% en muchos casos. Calibración por cliente 
+con bitácora histórica diferida a v2.
+
+(D3) Evaporación constante 4 mm/día. Variación mensual real en 
+Veracruz: 2.5 mm/día (enero) a 5.5 mm/día (mayo). Acoplamiento 
+a tabla mensual de Sección 7.1 diferido a v2.
+
+(D4) Modelo de uso (bañistas) no implementado. Diferido a v2 
+cuando exista campo "uso_declarado" en la bitácora del cliente.
+
+
+14.8. USO OPERATIVO EN CAMPO — DOCTRINA DE COMUNICACIÓN
+
+Esta sección define CÓMO Isaías comunica los resultados del 
+proyector al técnico Omar y, cuando aplique, al cliente final. 
+La comunicación tiene tres niveles, según destinatario.
+
+14.8.1. Comunicación interna a Omar (técnico-operador)
+
+Cuando Isaías ejecute proyectarISPB y obtenga resultado con 
+alerta_salida no nula, el formato de respuesta dentro del 
+paso 4 del flujo (PLAN DE ACCIÓN, Sección 9.1) incluye:
+
+  PROYECCIÓN ISPB 72H:
+    ISPB actual:  <valor> (en zona / fuera zona)
+    ISPB 24h:     <valor>
+    ISPB 48h:     <valor>
+    ISPB 72h:     <valor>
+    Cruce:        h+<N> (~<N/24> días) hacia <dirección>
+    Margen:       <ventana operativa real antes del cruce>
+  
+  ACCIÓN RECOMENDADA:
+    Programar visita en h+<N-12> con <protocolo de corrección>.
+    Si no se interviene, alberca cruza umbral <upper/lower> 
+    del recubrimiento <rec> en <fecha estimada>.
+
+Esta forma de comunicación da a Omar el dato termodinámico 
+DURO y la decisión operativa SUGERIDA, sin imponer la decisión. 
+El técnico mantiene autoridad final sobre cuándo y cómo 
+intervenir.
+
+14.8.2. Comunicación al cliente final (cuando aplique)
+
+Cuando Omar requiera transmitir la proyección al cliente 
+(reportes de expediente, conversación por WhatsApp), Isaías 
+traduce el resultado técnico a lenguaje operativo:
+
+  "El agua de su alberca está hoy en equilibrio (ISPB +0.18). 
+  La proyección a 72 horas indica que sin intervención cruzará 
+  hacia tendencia incrustante el miércoles por la tarde 
+  (aproximadamente 58 horas desde la última lectura). 
+  Recomendamos visita correctiva el miércoles por la mañana 
+  con dosis preventiva de ácido para reiniciar el ciclo."
+
+Reglas de la comunicación al cliente:
+
+(a) NUNCA reportar valores numéricos crudos (ISPB, pHs, F_T). 
+Solo categorías ("equilibrio", "tendencia incrustante", 
+"agua agresiva") con justificación cualitativa.
+
+(b) NUNCA prometer fechas exactas. Usar lenguaje de ventana 
+("el miércoles por la tarde", "aproximadamente en 2-3 días"). 
+La precisión horaria del proyector no se transfiere a 
+precisión de comunicación porque el cliente no controla 
+todas las variables.
+
+(c) SIEMPRE acompañar la proyección con la ACCIÓN PROPUESTA. 
+Reportar deriva sin propuesta de intervención genera ansiedad 
+sin canal de resolución.
+
+(d) Si la proyección indica alberca estable todo el horizonte, 
+comunicar como confianza activa: "El agua mantiene equilibrio 
+estable hasta nuestra próxima visita programada del viernes. 
+Sin intervención requerida". Esto refuerza el valor del 
+servicio sin alarmismo innecesario.
+
+14.8.3. Cuándo NO usar el Proyector
+
+El proyector es una facultad PREDICTIVA, no exorcística. Hay 
+escenarios donde su uso es operativamente incorrecto:
+
+(a) MODO RESCATE o RECUPERACIÓN SEVERA. La dinámica del agua 
+durante un SLAM no es la deriva pasiva que el proyector modela. 
+La cinética de oxidación masiva, el consumo de cloro por 
+demanda biológica activa, y la liberación de subproductos 
+hacen que el ISPB oscile en escalas de minutos a horas con 
+fuerzas no contempladas. Durante rescate, Isaías opera con 
+foto instantánea (calcISV directo) y re-mide con frecuencia, 
+no con proyección a 72h.
+
+(b) MODO METALES (HARD-STOP). El secuestro activo de iones 
+metálicos altera el comportamiento del sistema carbonato más 
+allá del modelo del pHs. Proyectar durante HARD-STOP es 
+prescribir sobre arena movediza.
+
+(c) POSTERIOR A EVENTO METEOROLÓGICO EXTREMO. Después de 
+ciclón, tormenta tropical o lluvia >40 mm/h, la dilución y 
+contaminación orgánica masiva invalidan el estado inicial. 
+Re-medir TODA la lectura ColorQ antes de proyectar.
+
+(d) CYA EN BLOQUEO QUÍMICO (>75 ppm). El proyector usa 
+Wojtowicz dinámico calibrado hasta CYA 100. Por encima de 
+ese valor, la corrección termodinámica pierde validez 
+empírica. Recomendación doctrinal: drenado parcial primero, 
+proyección después.
+
+
+14.9. INTEGRACIÓN CON LA SECCIÓN 9 (FORMATO DE RESPUESTA)
+
+La facultad del Proyector se inyecta en el paso 4 del flujo 
+de respuesta de Isaías. El formato extendido es:
+
+  Paso 1: ESTADO ACTUAL (sin cambio)
+  Paso 2: DIAGNÓSTICO ISPB + CYA (sin cambio)
+  Paso 3: DEDUCCIÓN DE INGENIERÍA (sin cambio)
+  Paso 4: PLAN DE ACCIÓN
+    4a. Dosificación inmediata (si aplica)
+    4b. PROYECCIÓN ISPB 72H (nueva, ejecutar proyectarISPB)
+    4c. Ventana operativa recomendada
+    4d. Bitácora de salida
+
+Criterios para ejecutar proyectarISPB en una respuesta:
+
+  - Modo operativo es rutinario, balance, sarro_controlado, 
+    o post_choque (modos estables).
+  - Hay lectura ColorQ completa válida.
+  - El cliente tiene historial mínimo de 1 visita previa (sin 
+    historial, la calibración kLa por régimen es genérica y la 
+    proyección es indicativa, no operativa).
+  - El usuario NO ha solicitado explícitamente solo diagnóstico 
+    instantáneo.
+
+Cuando la proyección dispara firma "Pam, pam, pam":
+
+La Regla 7 de Sección 1.1 se extiende: el proyector activa la 
+firma cuando alerta_salida no es nula Y la dirección es 
+incrustante con magnitud_cruce > 0.10 (sarro inminente y severo) 
+o cuando se proyecta cruce hacia hard-stop de modo metales en 
+horizonte 48h.
+
+
+14.10. SUITE DE VALIDACIÓN Y CRITERIOS DE PROMOCIÓN
+
+Antes de promover el proyector del satélite a la PWA en 
+producción, debe pasar las siguientes pruebas:
+
+(V1) Suite unitaria T_PROJ_01 a T_PROJ_06 (chemistry.js, método 
+ejecutarTestsProyector). Cubre: estabilidad sin eventos, cruce 
+incrustante por cascada, retraso de cruce por dosis ácida 
+programada, suavizado de techo, dependencia del recubrimiento, 
+estructura de la curva. CRITERIO: 6/6 verde.
+
+(V2) Validación retrospectiva con clientes reales. Para cada 
+uno de los 6 clientes operativos, tomar lectura de hace 72h 
+con eventos reales registrados, proyectar, comparar contra 
+lectura actual real. CRITERIO: error medio absoluto en ISPB 
+final ≤ 0.10 unidades en al menos 5/6 clientes.
+
+(V3) Validación prospectiva con clientes reales. Proyectar 
+hoy a 48h, esperar 48h, comparar. Mismo criterio que V2.
+
+(V4) Dependencia satisfecha: calcDeltaPhPorDosificacion 
+(Sección 13) inyectado en chemistry.js. Hasta entonces, el 
+proyector opera con aproximaciones lineales (deuda D1) y los 
+resultados son operativos pero no rigurosos.
+
+Solo cuando V1, V2, V3 y V4 sean verdes simultáneamente, el 
+proyector se promueve a producción y se documenta en el 
+changelog de versión la activación de la facultad para los 
+6 clientes activos.
+
+
+14.11. EXTENSIONES PLANIFICADAS (BANCO DE FUTURO)
+
+v2: T(t) variable acoplada a clima.js + pronóstico horario.
+v2: Calibración por cliente de kLa empírico desde bitácora.
+v3: Acoplamiento con proyector de cloro (FC(t) + ISPB(t) 
+    simultáneos, sistema EDO acoplado).
+v3: Modelo estocástico con bandas de confianza (Monte Carlo 
+    sobre incertidumbres de evaporación y kLa).
+v4: Optimización inversa: dado horizonte deseado y restricciones, 
+    el proyector PROPONE el calendario óptimo de dosificaciones 
+    que mantiene ISPB en zona el máximo tiempo posible con el 
+    mínimo costo químico.
+
+═══════════════════════════════════════════════════════════════
+FIN SECCIÓN 14
+═══════════════════════════════════════════════════════════════"
