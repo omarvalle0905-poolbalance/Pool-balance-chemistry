@@ -1,0 +1,241 @@
+# DOSSIER DE SALIDA — Sala Pool Balance del 23 de mayo de 2026
+
+**Operador:** Omar Alberto Valle Mercado
+**Sala:** cierre del día 23 de mayo de 2026
+**Próxima sala:** apertura con CLAUDE.md y este dossier cargados.
+**Estatus:** Sala cerrada con honores. Trabajo productivo entregado.
+
+---
+
+## 1. LO QUE SE TERMINÓ HOY
+
+### 1.1 Bug del lightbox de fotos en el portal cliente
+
+Diagnóstico, corrección y entrega del fix para `js/views/bitacora-detalle.js` en el repo `Pool-balance-mx`. Causa raíz: las fotos se guardan en Firestore como objetos `{url, path, momento, timestamp}` pero el código las trataba como strings, resultando en `src="[object Object]"`. Solución: helper `_fotoToUrl(foto)` que normaliza ambos formatos. Versión `v1.0.1`. Commit aplicado, redeploy en Vercel, verificado funcionando con el servicio del 22-05.
+
+### 1.2 Análisis de tres versiones del Proyector Temporal del ISPB
+
+Recibidas tres versiones del entregable del Proyector (V1 base, V2 fusión G+P, V3 con deudas D1-D4). Archivadas sin análisis prematuro según pedido de Omar. Comparativa hecha al final.
+
+### 1.3 Lectura completa de la doctrina
+
+Lectura del repo `Pool-balance-chemistry`:
+- `chemistry (8).js` v16.6.0 (motor actual en producción).
+- `ENTREGABLE F COMPLETO.md` (Sección 13: `calcDeltaPhPorDosificacion`).
+- `PASO 1 — Refactor de calcISV con Wojtowicz dinámica.md` (v16.7.0).
+- `reglas_de_oro.md` (12 reglas inmutables).
+- `Entregable A — Sección 13 del CÓDYCE NEXUS V17.7`.
+- `SECCIÓN 14 — Proyector Temporal del ISPB` (doctrina madre).
+- `Entregable I — Protocolo de Calibración Empírica`.
+- Entregables B, D, E (respaldos y diagramas).
+
+### 1.4 Primera entrega del Proyector v16.8.0
+
+Generada y subida al repo. Revisor externo identificó 8 observaciones; análisis honesto: 4 correcciones reales (alkalin.dALK 10× chico, tricloro.dpH muy bajo, cloro_liquido con unidades mezcladas, test T_PROJ_03 dependiente de baseline) y 4 falsas alarmas o cosméticas.
+
+### 1.5 Re-entrega del Proyector v16.7.0 alineado a doctrina
+
+Versión definitiva alineada al pie de la letra con la Sección 14 del Códyce:
+- Renombrado de v16.8.0 a **v16.7.0** (Wojtowicz + Proyector bajo misma versión, como manda la doctrina).
+- Nomenclatura de eventos corregida: `dosis_tricloro`, `dosis_hipo_calcio`, etc. con prefijo `dosis_`.
+- Payload doctrinal: `cantidad_g`, `cantidad_ml`, `volumen_pct`.
+- Estructura de retorno con campos `direccion`, `ISPB_en_cruce`, `magnitud_cruce`, `umbral_violado`.
+- Suite reducida a 6 tests (T_PROJ_01 a T_PROJ_06) como pide Sección 14.10.
+- 4 correcciones del revisor aplicadas.
+- Subido al repo en archivo Markdown único: `ENTREGABLE G — Proyector Temporal del ISPB v16.7.0.md`.
+
+---
+
+## 2. ENTREGAS ACUMULADAS DEL PROYECTO
+
+### 2.1 PWA Técnica (`pool-balance-15`)
+
+- `js/firestore-sync.js` **v1.0.3** — bridge offline ↔ Firestore.
+- `js/photo-queue.js` **v1.0.1** — cola de subida de fotos con compresión 800px JPEG 0.75.
+- `js/photo-ui.js` **v1.0.2** — UI de captura, miniaturas, lightbox.
+- `index.html` con sesión persistente de admin y creación de usuarios cliente vía Firebase Auth secundario.
+
+### 2.2 PWA Cliente (`Pool-balance-mx`)
+
+- Portal en producción en Vercel.
+- `js/views/bitacora-detalle.js` **v1.0.1** con fix de fotos como objeto.
+- Acceso con `cliente_id` + PIN 6 dígitos.
+- Lectura tiempo real desde Firestore.
+- Score 0-100 de calidad de agua, badges, PDF, WhatsApp share.
+
+### 2.3 Repo de Química (`Pool-balance-chemistry`)
+
+- `chemistry (8).js` v16.6.0 (motor actual).
+- Doctrina viva: Sección 13, Sección 14, reglas de oro, Entregable I.
+- Entregables A, B, D, E, F, G, I cargados.
+- PASO 1 documentado pendiente de integración.
+
+### 2.4 Bugs resueltos en el día
+
+- Lightbox de fotos en portal cliente (formato objeto vs string).
+
+### 2.5 Bugs resueltos acumulados del proyecto
+
+- Sobrescritura de bitácoras del mismo día (IDs ahora `YYYY-MM-DD_HHMM`).
+- Sesión de admin que se rompía al crear cliente (cuenta secundaria de Firebase Auth).
+- PhotoUI con `poolId` undefined.
+- Errores silenciosos de subida de fotos.
+- Mapeo objeto→string en galería del portal cliente.
+
+---
+
+## 3. LO QUE QUEDA PENDIENTE (PRIORIZADO)
+
+### 3.1 Alta prioridad (próxima sala)
+
+1. **Aplicar PASO 1 (Wojtowicz dinámica) sobre `chemistry.js`** y subir a v16.7.0. Doctrina ya cargada en el repo.
+2. **Aplicar Entregable G (Proyector Temporal)** después del PASO 1, dentro de la misma v16.7.0. Archivo `ENTREGABLE G — Proyector Temporal del ISPB v16.7.0.md` ya en el repo.
+3. **Ejecutar suite V1**: `Chemistry.ejecutarTestsProyector()` debe devolver 6/6 verde.
+4. **Validar mapeo cliente ↔ alberca** en Firestore para los 6 clientes activos.
+5. **Asegurar `cliente_id` válido** para todos los clientes.
+6. **Corrida real de bitácoras con fotos** end-to-end con dos clientes piloto.
+7. **Revisar generación de PDF** del portal cliente (verificar que ya no sufra del mismo bug de objeto/string en fotos).
+
+### 3.2 Media prioridad
+
+1. **Integrar Entregable F** (`calcDeltaPhPorDosificacion`) al motor. Cierra deuda D1 del Proyector automáticamente.
+2. **Validación V2** retrospectiva: tomar lectura de hace 72h con eventos registrados, proyectar, comparar con realidad. Criterio: error ≤0.10 ISPB en ≥5 clientes.
+3. **Validación V3** prospectiva: proyectar hoy a 48h, esperar, comparar.
+4. **Backup semanal en JSON** del estado de Firestore.
+5. **Migración a repositorio técnico unificado** (decisión pendiente: mantener separados PWA técnica / cliente / química, o consolidar).
+6. **Auditoría de `isaias.js` v16.7.3** y merge si aplica.
+7. **Implementar cálculo de impacto pH** dentro del flujo de Isaías (paso 6-bis del flujo de 9 pasos, según Sección 13.8).
+
+### 3.3 UI/UX
+
+1. **Aplicar paleta oficial** consistentemente en todas las vistas.
+2. **Agrandar botones** de la PWA técnica para uso en campo bajo sol.
+3. **Modo "Auto"** que sugiera dosis sin requerir clicks adicionales (con bandera ámbar de override automático según regla 10).
+
+### 3.4 Baja prioridad
+
+1. **Cerrar repos públicos** (decisión de privacidad pendiente).
+2. **Rotar credenciales** de Firebase y revisar exposición pública de la API key.
+3. **Auditoría de `engine.js`** y `chemistry.js` completos.
+4. **Migrar datos históricos** a Firestore (región `northamerica-south1`).
+5. **Implementar Entregable I** (calibración empírica) cuando haya ≥15 dosificaciones registradas por producto.
+
+### 3.5 Deudas técnicas declaradas del Proyector
+
+- **D1** — Aproximaciones lineales en `_aplicarEventoProyector`. Cierra automáticamente cuando Entregable F esté inyectado.
+- **D2** — Zonas de recubrimiento duplicadas en `CONST` y dentro de `calcISV`. Refactor menor.
+- **D3** — Temperatura constante en el horizonte. Diferido a v2 con `T(t)`.
+- **D4** — kLa empírico por cliente. Diferido a v2 con bitácora histórica.
+
+---
+
+## 4. ARQUITECTURA Y SEGURIDAD AL CIERRE
+
+### 4.1 Esquema Firestore
+
+```
+clientes/{clienteId}/
+├── alberca/principal
+└── bitacoras/{YYYY-MM-DD_HHMM}
+    ├── fecha, tecnico
+    ├── lecturas {pH, cloro, alk, dureza, cya, temp, tds}
+    ├── fotos [{url, path, momento, timestamp}]
+    ├── pdf_url, score
+```
+
+### 4.2 Storage paths
+
+`clientes/{clienteId}/albercas/principal/bitacoras/{bitacoraId}/foto-N.jpg`
+
+### 4.3 Seguridad
+
+- Keys de GitHub revocadas previamente.
+- Reglas de Firestore endurecidas: admin lectura/escritura, cliente solo lectura de su propio nodo.
+- API key pública pero protegida por reglas.
+- Pendiente: revisión completa de superficie de ataque y rotación rutinaria.
+
+---
+
+## 5. FLUJO END-TO-END (REFERENCIA RÁPIDA)
+
+```
+[Captura ColorQ en campo]
+        ↓
+[EventBus dispatch lectura_nueva]
+        ↓
+[chemistry.js calcula ISPB, alertas, dosis]
+        ↓
+[Bitácora generada con ID YYYY-MM-DD_HHMM]
+        ↓
+[Persistencia en localStorage (verdad local)]
+        ↓
+[Foto capturada → comprimida → IndexedDB pending]
+        ↓
+[Sync eventual a Firestore + Storage]
+        ↓
+[Portal cliente lee Firestore en tiempo real]
+        ↓
+[Cliente ve bitácora, score, fotos, PDF, share WhatsApp]
+```
+
+---
+
+## 6. INSTRUCCIONES PARA LA PRÓXIMA SALA
+
+### 6.1 Apertura
+
+1. Cargar `CLAUDE.md` como directriz maestra en la configuración del proyecto en Anthropic.
+2. Cargar este dossier (`DOSSIER_SALIDA_2026-05-23.md`) como contexto inicial.
+3. Confirmar que Claude entiende el estado: motor en v16.6.0 base, PASO 1 y Proyector G documentados pero **no integrados aún en el archivo de producción**.
+
+### 6.2 Primera tarea sugerida
+
+Aplicar el PASO 1 (Wojtowicz dinámica) al archivo `chemistry (8).js` del repo y promover a v16.7.0. Doctrina disponible en: `PASO 1 — Refactor de calcISV con Wojtowicz dinámica.md` dentro del repo `Pool-balance-chemistry`.
+
+### 6.3 Segunda tarea sugerida
+
+Inmediatamente después del PASO 1, aplicar el Entregable G usando el archivo `ENTREGABLE G — Proyector Temporal del ISPB v16.7.0.md` ya cargado en el repo. Ambas cirugías dejan el archivo en v16.7.0 final.
+
+### 6.4 Validación obligatoria al cerrar la próxima sala
+
+```js
+Chemistry.ejecutarTestsProyector();
+```
+
+Criterio: **6/6 verde**. Si hay tests rojos, no promover y reabrir el caso.
+
+### 6.5 Reglas que la nueva sala debe respetar desde el primer mensaje
+
+- Las 12 reglas de oro (sección 3 del CLAUDE.md).
+- Las acciones prohibidas (sección 4 del CLAUDE.md).
+- Las convenciones de código (sección 5 del CLAUDE.md).
+- El tono y trato hacia Omar (sección 9 del CLAUDE.md).
+
+---
+
+## 7. CONTEXTO COMERCIAL
+
+- 6 clientes activos en producción.
+- Clientes piloto identificados para pruebas de validación.
+- Calendario de servicio semanal regular.
+- Comunicación con cliente vía WhatsApp + portal.
+- Identidad de marca: Pool Balance — Gestoría Hídrica Profesional.
+
+---
+
+## 8. NOTAS PERSONALES DE LA SALA
+
+- Sala productiva. Se avanzó simultáneamente en frontend (fix de fotos) y en doctrina del motor (lectura completa + Proyector v16.7.0 alineado).
+- Omar trabajó desde celular toda la sesión, paciente y enfocado, a pesar del cansancio acumulado.
+- Se cerró con honores. Conversación guardada para archivo.
+- Próxima sala debe empezar con CLAUDE.md cargado en el proyecto de Anthropic para evitar repetir contexto.
+
+---
+
+## 9. CIERRE
+
+Sala cerrada con respeto y orgullo. Trabajo del día queda asentado en este dossier y en el repo. Los archivos clave están todos versionados y respaldados. La próxima sala arranca con base sólida.
+
+— Pool Balance · Gestoría Hídrica Profesional
+— Omar Alberto Valle Mercado · RFC VAMO870509HW3
+— Cierre del 23 de mayo de 2026
