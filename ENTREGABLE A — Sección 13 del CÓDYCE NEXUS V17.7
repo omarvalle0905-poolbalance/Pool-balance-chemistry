@@ -1,0 +1,128 @@
+ENTREGABLE A — Sección 13 del CÓDYCE NEXUS V17.7
+
+A continuación, la nueva sección redactada en el estilo exacto del códice: ecuaciones en texto plano (anti-LaTeX como exige Regla 2), tablas con trazabilidad, anotaciones de fuente, integración explícita con funciones del motor existentes, y bloques de auditoría amarillos al final.
+
+Sección 13 — Impacto Ácido-Base Inmediato de la Dosificación (Coeficiente ν Dinámico)
+
+Esta sección dota a Isaías de la facultad de predecir el ΔpH inmediato producido por la dosificación de cualquier producto químico del catálogo Pool Balance, ANTES de aplicarlo. Se distingue del fenómeno de desgasificación de CO₂ (Sección 12), que actúa en escala de horas; aquí se modela el impulso ácido-base instantáneo en el momento de la disolución.
+Calibrada contra Morris (1966), Stumm & Morgan (1996), Pankow (2018), Wahman & Alexander (2018), WHO (2008) y O’Brien et al. (1974). Implementación nativa prevista en chemistry.js v16.7 como calcDeltaPhPorDosificacion.
+
+13.1. Fundamento — Coeficiente Estequiométrico Ácido-Base ν
+Para cada producto químico se define el coeficiente ν como:
+ν = mol de H⁺ neto liberados por mol de producto comercial dosificado
+Convención de signos: ν > 0 implica acidificante (consume alcalinidad). ν < 0 implica alcalinizante (aporta alcalinidad).
+El cambio de alcalinidad por dosificación es:
+ΔAlk = − ν × C_P
+donde C_P es la concentración molar del producto añadido al volumen del vaso. La respuesta de pH se obtiene por:
+ΔpH ≈ − (ν × C_P) / β    (válido si |ΔpH| < 0.3)
+donde β es la capacidad buffer total del agua (Sección 13.4). Para perturbaciones mayores debe resolverse la cuártica acoplada (Sección 13.5).
+
+13.2. Especiación del Cloro Libre (Pankow Activo)
+Se reutiliza la función calcFraccionHOCl(pH, T) del motor (Sección 5.3), con:
+pKa_HOCl(T) = 7.582 − 0.00913 × (T − 25)    [Pankow, válida 5–40 °C]
+f_HOCl(pH, T) = 1 / (1 + 10^(pH − pKa_HOCl(T)))
+
+f_OCl(pH, T) = 1 − f_HOCl(pH, T)
+Estas dos fracciones gobiernan todos los coeficientes ν de productos clorados.
+
+13.3. Tabla Maestra de Coeficientes ν por Producto
+Valores expresados en mol H⁺ por mol de producto comercial activo. La columna “ν a pH 7.5 / T 30 °C” usa los parámetros operativos típicos de Veracruz para referencia rápida; el motor recalcula dinámicamente con las lecturas reales.
+
+Producto Pool Balance	Fórmula	Ecuación de ν(pH, T)	ν a pH 7.5, T 30 °C	Carácter
+Tricloro 90% (Clorizide 91)	C₃Cl₃N₃O₃	3·f_OCl + α_Cy1	≈ +2.30	Fuerte ácido
+Hipoclorito Calcio 65% (Klaren)	Ca(OCl)₂	−2·f_HOCl − 2·η_CaOH₂	≈ −1.05	Fuerte base
+Cloro Líquido 12% (NaOCl)	NaClO	−f_HOCl − η_NaOH	≈ −0.55 a −0.70	Base moderada
+Bisulfato Klaren 50%	NaHSO₄	+1.0	+1.00	Ácido fuerte
+Ácido Muriático 31.45%	HCl	+1.0	+1.00	Ácido fuerte
+Alkalin (Bicarbonato)	NaHCO₃	−α_1_CO₃ (≈ +α_0 si pH < pKa1)	≈ −0.93	Base leve (sube ALK casi sin pH)
+Alcalos (Carbonato)	Na₂CO₃	−(1 + α_1_CO₃)	≈ −1.93	Base fuerte
+Mg(OH)₂ Amortiguador Magnesio	Mg(OH)₂	−2 · (limitado por solubilidad)	≈ −0.40 efectivo	Base moderada (limita en pH ~8.5)
+Ácido Cianúrico	C₃H₃N₃O₃	+α_Cy1	≈ +0.81	Ácido débil
+Cloruro de Calcio	CaCl₂	0 (sal neutra)	0.00	Neutro
+Donde:
+α_Cy1(pH) = 1 / (1 + 10^(pKa1_CYA − pH))    con pKa1_CYA = 6.88
+α_0_CO₃(pH) = 1 / (1 + 10^(pH − pKa1_H₂CO₃))    con pKa1_H₂CO₃ = 6.35
+α_1_CO₃(pH) = 1 / (1 + 10^(pKa2_H₂CO₃ − pH))   con pKa2_H₂CO₃ = 10.33
+η_NaOH = mol NaOH libre / mol NaOCl en producto comercial (default 0.05; máx 0.10)
+η_CaOH₂ = mol Ca(OH)₂ residual / mol Ca(OCl)₂ comercial (default 0.03; máx 0.05)
+
+13.4. Capacidad Buffer Total β (Stumm & Morgan Multibuffer)
+β = 2.303 × { [H⁺] + [OH⁻] + C_T·α0_CO₃·α1_CO₃ × (1 + 4·α2_CO₃/α1_CO₃) + Cy_T·α_Cy0·α_Cy1 + FC·f_HOCl·f_OCl }
+donde:
+C_T = alcalinidad carbonatada total (ALK_corr de Wojtowicz expresada en mol/L)
+Cy_T = CYA total en mol/L (CYA_ppm / 129.07 × 10⁻³)
+FC = cloro libre en mol/L (FC_ppm / 70.91 × 10⁻³)
+α2_CO₃ = K₂/[H⁺] · α1_CO₃ (fracción CO₃²⁻)
+α_Cy0 = 1 − α_Cy1
+Unidades: β en eq/(L · unidad pH).
+Para aguas de piscina veracruzanas típicas (ALK 100, CYA 50, FC 4, pH 7.5, T 30°C), β ≈ 2.3 × 10⁻⁴ eq/(L·pH). El sistema carbonato aporta >85% de β.
+
+13.5. Resolución No Lineal — Cuártica en [H⁺]
+Cuando |ΔpH| predicho por el modelo lineal supera 0.3, o cuando ALK < 60 ppm, se invoca el resolvedor cuártico. Partiendo de Alk_f = Alk_0 − ν·C_P y sustituyendo en:
+Alk = C_T · (K₁·[H⁺] + 2·K₁·K₂) / ([H⁺]² + K₁·[H⁺] + K₁·K₂) + Kw/[H⁺] − [H⁺] + términos_CYA
+Reordenando se obtiene una ecuación cuártica en [H⁺] cuya raíz positiva real, único valor físicamente admisible, da el pH final exacto. El motor v16.7 implementará esto vía Newton-Raphson con tolerancia 10⁻⁹.
+
+13.6. Reporte de Incertidumbre — Tres Escenarios (Opción C)
+Cada predicción de Isaías incluye tres valores:
+ΔpH_base: cálculo con constantes default y lecturas exactas reportadas.
+ΔpH_pesimista: cálculo asumiendo η_NaOH/η_CaOH₂ en máximo de literatura, T_agua +2°C, ALK_corr −10% por error de medida ColorQ.
+ΔpH_optimista: cálculo asumiendo η_NaOH/η_CaOH₂ = 0, T_agua exacta, ALK_corr +10%.
+Formato de salida de Isaías:
+“ΔpH proyectado: −0.18 (rango −0.25 a −0.12)”
+La Opción B (banda formal por propagación gaussiana de errores) queda implementada en código según especificación del Entregable C, accesible vía flag incertidumbreFormal=true para análisis técnico.
+
+13.7. Premedicación Sugerida — Lógica Automática
+Si ΔpH_pesimista proyecta sacar el pH del rango operativo del modo activo (Sección 1.4) o de la ventana del recubrimiento (Sección 4.3), Isaías emite:
+“PREMEDICACIÓN SUGERIDA — banda de seguridad:”
+Para acidificación excesiva (ν > 0, pH proyectado < piso):
+Dosis sugerida de Alkalin (NaHCO₃) para subir ALK previamente, calculado como:
+g_Alkalin = (pH_piso − pH_proyectado_pesimista) × β × V × 84.01 × 10³ × factor_seguridad
+con factor_seguridad = 1.3.
+Para alcalinización excesiva (ν < 0, pH proyectado > techo):
+Dosis sugerida de Bisulfato Klaren o Ácido Muriático, calculada análogamente y referida a la API calcDosificacion.
+La premedicación es CONDICIONAL: Isaías marca con bandera explícita “[PREMEDICACIÓN — opcional]” y permite que Omar la acepte o ignore según su criterio de campo.
+
+13.8. Protocolo de Razonamiento de Isaías (Integrado al Flujo de 9 Pasos)
+Insertar como paso 6-bis entre “calcDegradacionCloro” y “calcDosificacion”:
+6-bis. Antes de prescribir dosis, ejecutar calcDeltaPhPorDosificacion(producto, dosis_propuesta, V, lecturas_actuales) para obtener ΔpH proyectado y sus tres escenarios.
+6-ter. Si ΔpH_pesimista sale del rango operativo, ejecutar lógica de premedicación (13.7) y reportar ambos protocolos: principal + premedicación opcional.
+6-quater. Recalcular ISPB final proyectado con pH_final = pH_actual + ΔpH_base, conservando ALK_corr actualizado (ALK_corr_final = ALK_corr − ν·C_P expresado en ppm CaCO₃).
+
+13.9. Ejemplo Operativo Veracruz — Caso Tricloro
+Lectura: V=40 m³, pH=7.4, FC=2 ppm, ALK=90 ppm, CYA=40 ppm, CH=220 ppm, T_agua=30 °C, recubrimiento porcelanato.
+Acción: Omar quiere subir FC a 5 ppm con Tricloro Clorizide 91 (90%).
+Cálculo de dosis (Sección 3.1): Dosis = (5−2) × 40 / 0.90 = 133 g de tricloro.
+Cálculo de impacto pH:
+moles_tricloro = 133 g × 0.915 / 232.41 g/mol = 5.24 × 10⁻¹ mol / 40,000 L = 1.31 × 10⁻⁵ M
+pKa_HOCl(30°C) = 7.582 − 0.00913·5 = 7.536
+f_OCl(7.4, 30°C) = 1 / (1+10^(7.4−7.536)) = 0.422
+pKa1_CYA(30°C) = 6.88 − 0.011·5 = 6.825
+α_Cy1(7.4, 30°C) = 1 / (1+10^(6.825−7.4)) = 0.790
+ν_TCCA = 3·0.422 + 0.790 = 2.056
+ΔAlk = −2.056 × 1.31 × 10⁻⁵ = −2.69 × 10⁻⁵ eq/L = −1.35 ppm CaCO₃
+β estimado (ALK 90, CYA 40, pH 7.4, T 30) = 3.97 × 10⁻⁴ eq/(L·pH)
+ΔpH_base = −2.69 × 10⁻⁵ / 3.97 × 10⁻⁴ = −0.068
+Tres escenarios: ΔpH = −0.07 (−0.09 a −0.06).
+pH_final proyectado: 7.33 (rango 7.31–7.34).
+Modo rutinario, piso pH 7.2 → dentro de rango. Sin premedicación necesaria.
+ALK_corr final estimada: 75.8 ppm. ISPB recalculado dentro de zona porcelanato.
+
+Salida de Isaías:
+“Dosifica 133 g de tricloro Clorizide 91. ΔpH proyectado: −0.07 (rango −0.09 a −0.06). pH final esperado 7.33. ALK final 88.6 (cruda). ISPB se mantiene en zona porcelanato. Próxima revisión en 24 h. —Isaías”
+
+13.10. Tabla de Validez del Modelo
+
+Condición	Modelo aplicable	Acción del motor
+ALK > 60 ppm y ΔpH < 0.3	Lineal (Henderson-Hasselbalch modificado)	Cálculo rápido y 3 escenarios
+ALK 30–60 ppm o ΔpH 0.3–0.6	Cuártico (Newton-Raphson)	Reporta ambos escenarios
+ALK < 30 ppm o ΔpH > 0.6	Modo SLAM activo + dosis choque	Fallback no lineal o alerta de límite
+Modo metales (HARD-STOP)	No aplica	Bloqueado por Regla 5
+AUDITORÍA V17.7 → V17.8 (al añadir Sección 13)
+A1 — Nueva facultad: predicción de ΔpH inmediato por dosificación. Cierra el hueco identificado donde NAOCL_DELTA_ALK_POR_PPM_CL solo decía “positivo” sin valor numérico (Sección 2). Ahora el motor calcula dinámicamente vía ν(pH, T).
+A2 — Convención ν unificada: mol H⁺ por mol de producto comercial, NO por mol de Cl₂ equivalente. Esto elimina la ambigüedad histórica entre fuentes y resuelve el problema dimensional señalado en la auditoría científica externa de mayo 2026.
+A3 — Coherencia con motor: ν_clorados usa calcFraccionHOCl existente (Sección 5.3, Pankow). No se introduce constante redundante.
+A4 — Integración con Wojtowicz: β consume ALK_corr (Sección 4.1.1), no ALK cruda. CYA se incorpora a β con su propio pKa1.
+A5 — Premedicación: lógica explícita y CONDICIONAL. Bandera obligatoria “[PREMEDICACIÓN — opcional]”. Evita que Isaías prescriba protocolos duales sin consentimiento de Omar.
+A6 — Reporte de tres escenarios: estándar para todas las predicciones de ΔpH. Convención Pool Balance frente a la práctica industrial de reportar un solo número sin banda.
+A7 — Cuártica en chemistry.js v16.7: implementación Newton-Raphson con tolerancia 10⁻⁹, fallback al modelo lineal si no converge en 30 iteraciones.
+A8 — Caso de uso Veracruz: ejemplo numérico completo en 13.9 valida la cadena de cálculo extremo a extremo (Actualizado con balance termodinámico preciso).
