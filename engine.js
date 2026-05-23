@@ -1,0 +1,1619 @@
+// ============================================================
+// ARCHIVO: js/engine.js — El Director de Orquesta de Pool Balance
+// Motor de Simulación (Orquestador) del Gemelo Digital Ciber-Físico
+// ============================================================
+// VERSIÓN: 16.4.5 — FIX BUG-010 (Sala B): exposición de modo_operativo en
+//   payloads de EventBus y observaciones de Isaías.
+//   Causa: el motor calcula state.calculado.modo_operativo correctamente
+//   (V16.4.2/V16.4.3 cerraron BUG-001 y BUG-008), pero el modo NO se
+//   propagaba a la UI. Banners, alertas y dosis seguían comportándose
+//   como si el modo fuera 'rutinario' porque los payloads de EventBus
+//   no exponían el campo de forma plana y las observaciones de Isaías
+//   tampoco lo transportaban.
+//   Solución: añadir modo_operativo (con fallback a 'rutinario') como
+//   campo plano en los 4 payloads de EventBus emitidos por el engine
+//   (poolState:updated × 2, engine:proyeccion_completada,
+//   engine:recalculo_completado) y en las 2 llamadas a
+//   DB.saveIsaiasObservacion (datos.modo_operativo + mención en resumen).
+//   NO se añaden llamadas a Chemistry desde el engine. NO se refactoriza
+//   nada fuera del scope. state.calculado.modo_operativo se mantiene
+//   como única fuente de verdad; el fallback se aplica solo en el
+//   momento de emitir, nunca se persiste un valor inventado al state.
+//
+// VERSIÓN: 16.4.4 — FIX BUG-009: TDS/pH/cloro absurdos tras anclar diagnóstico.
+//   Causa: el listener envenenaba state.timestamp con epoch (1970) para
+//   forzar reproyección, lo que hacía a proyectarEstadoActual integrar
+//   56 años de evaporación/desgasificación en una sola pasada. TDS se
+//   multiplicaba por 300, pH se disparaba a +infinito, cloro colapsaba
+//   a 0.
+//   Solución: proyectarEstadoActual ahora acepta { forzar: true } para
+//   saltar UMBRAL_REPROYECCION_HORAS sin tocar el timestamp real.
+//   Cap defensivo MAX_HORAS_SIN_ANCLA aplicado a la integración física.
+//
+// VERSIÓN: 16.4.3 — FIX BUG-008: TIPOS_EVENTO.DIAGNOSTICO_ANCLADO ahora es
+//   'DIAGNOSTICO_ANCLADO' (mayúsculas) para matchear el toUpperCase()
+//   del switch. Sin este fix, el case nunca se ejecutaba y modo_operativo
+//   quedaba en default 'rutinario'. Causa raíz por la que BUG-001 y
+//   BUG-007 parecían "arreglados" pero el modo nunca cambiaba en campo.
+//   ADEMÁS: state.calculado.claridad_actual ya no guarda el objeto
+//   salud_agua entero, solo el número 0..6.
+//
+// VERSIÓN: 16.4.2
+//   FIX BUG-007: procesa bitacora:diagnostico_anclado y fuerza
+//     proyectarEstadoActual() tras anclar diagnóstico, garantizando
+//     que modo_operativo y física de degradación queden sincronizados.
+//   FIX BUG-001: _calcularModoOperativo revisado contra tabla de
+//     derivación completa. Guardas defensivas en todos los parámetros
+//     de entrada para evitar cortocircuito a 'rutinario' por NaN/undefined
+//     en tipoAlga, claridadActual o naturalezaColor.
+//
+// VERSIÓN: 16.4.1 — Fix: persistencia de campos calculados anclados en proyectarEstadoActual
+//   - proyectarEstadoActual: agrega ...state.calculado como primera propiedad del
+//     objeto calculado en nuevoState. Esto crea simetría con recalcularTrasEvento
+//     y preserva modo_operativo, claridad_actual, equipo_snapshot,
+//     agua_origen_servicio, protocolo_operativo, bloqueo_cloracion
+//     tras refrescar la página o tras la proyección periódica de 5 min.
+//     (Mapa Conceptual sec 11 — Regla de Oro #6)
+//
+// VERSIÓN: 16.4.0 — Modo operativo + DIAGNOSTICO_ANCLADO + albedo + desgasificación dinámica
+//   - _calcularModoOperativo(tipoServicio, naturalezaColor, claridadActual, tipoAlga, ispb):
+//     deriva el modo según tabla V17.2 sec 5.2 / Mapa Conceptual sec 10.
+//     Regla 1 (metales) es HARD-STOP. Expuesta como Engine.calcularModoOperativo.
+//   - TABLA_SEVERIDAD_ALGA congelada (Mapa Conceptual sec 5.1).
+//   - TIPOS_EVENTO.DIAGNOSTICO_ANCLADO: nuevo evento V17.2 sec 9.
+//     Persiste claridad_actual, equipo_snapshot, agua_origen_servicio
+//     en poolState.calculado y recalcula modo_operativo.
+//     NO toca alberca.salud_inicial (Regla de Oro #11).
+//   - calcDegradacionCloro: ahora recibe albedo del recubrimiento
+//     desde alberca.geometria_adn.recubrimiento.albedo_refractivo.
+//     Resuelve dato huérfano D1.
+//   - _calcularFactorDesgasificacionDinamico: combina factor base
+//     del expediente con horas reales de hidrojets/cascada del
+//     último servicio. Decaimiento exponencial vida media 12h.
+//     Resuelve E9 y E10 (Cirugía 2 del Manifiesto).
+//
+// VERSIÓN: 16.3.2 — Fix Bug registro parcial (Ancla Rápida):
+//   - NUEVO: _tieneValorExplicito() — detecta si un campo fue medido por el
+//     técnico vs. no incluido en un registro parcial.
+//   - Caso REGISTRO en recalcularTrasEvento ahora usa _tieneValorExplicito()
+//     para cada parámetro. Si el campo no fue incluido en el registro, se
+//     conserva el valor anterior del state en lugar de sobrescribirlo con 0.
+//   - Esto habilita el Ancla Rápida (pH + Cloro) sin destruir ALK, CH, CYA, TDS.
+//   - Sin cambios en ISV, multiplicadores, ni arquitectura de delegación.
+// VERSIÓN: 16.3.1 — Integración de Solar.js (módulo de sombra):
+//   - NUEVO: Factor de sombra UV calculado por Solar.calcFactorSombraEfectivo().
+//   - El UVI crudo de clima se multiplica por factorSombraUV antes de
+//     alimentar calcDegradacionCloro. Esto ajusta la degradación por las
+//     obstrucciones reales (bardas, árboles) del entorno de la alberca.
+//   - Modo inteligente: instantáneo para proyecciones <4h, diario para >4h.
+//   - Si Solar.js no está cargado, el UV pasa sin ajuste (retrocompatible).
+//   - factorSombraUV incluido en el state y en los payloads de EventBus.
+// VERSIÓN: 16.3 — Factores externos y observación para Isaías:
+//   - NUEVO: FACTORES_EXTERNOS como tipo de evento en recalcularTrasEvento.
+//   - NUEVO: _calcularMultiplicadoresExternos() — multiplicadores de degradación
+//     basados en factores de bitácora (norte, lluvia, pool party, hojas, etc.).
+//   - Degradación de cloro y drift de pH ahora afectados por multiplicadores.
+//   - Decaimiento automático de multiplicadores (vida media 48h, eliminación a 7 días).
+//   - Engine escribe observaciones en memoria de Isaías (DB.saveIsaiasObservacion)
+//     tras cada proyección y recalculación.
+//   - Payload de engine:recalculo_completado ampliado con multiplicadores.
+// VERSIÓN: 16.2.1 — Corrección de física de dilución:
+//   - NUEVO: volumen_actual_m3 como variable dinámica del state.
+//     El volumen nominal (expediente) es el volumen del vaso lleno.
+//     volumen_actual_m3 rastrea el nivel real de agua.
+//   - RETROLAVADO/VACIADO/ASPIRADO: Ya no modifican concentraciones (ppm).
+//     Solo reducen volumen_actual_m3. La concentración permanece intacta
+//     porque la solución que sale lleva la misma concentración que el vaso.
+//   - LLENADO: _mezclarPorReposicion ahora usa volumen_actual_m3 en lugar
+//     del volumen nominal. Esto produce la dilución correcta en un solo paso.
+//   - Se elimina _diluirPorPerdida (ya no es necesaria).
+//   - TDS en evaporación (proyectar): usa volumen_actual_m3 como base.
+//   - Sin cambios en EventBus, ISV, ni arquitectura de delegación.
+
+/**
+ * @file engine.js
+ * @description Orquestador del Gemelo Digital para Pool Balance V16.4.5.
+ * Este archivo NO contiene fórmulas químicas. Su responsabilidad
+ * es coordinar el flujo de datos entre DB, Chemistry, Clima, Solar y EventBus.
+ *
+ * @author Omar Alberto Valle Mercado | VAMO870509HW3
+ * @version 16.4.5
+ * @depends window.EventBus (js/eventBus.js)
+ * @depends window.DB (js/db.js V16.3)
+ * @depends window.Chemistry (js/chemistry.js V16.5.3)
+ * @depends window.Clima (js/clima.js)
+ * @depends window.Solar (js/solar.js) — Opcional. Si no está, UV sin ajuste.
+ */
+
+(function () {
+  'use strict';
+
+  // ─── V16.4.5: bump de versión ────────────────────────────────────────────────
+  // FIX BUG-010 (Sala B): modo_operativo viaja como campo plano en los 4
+  //              payloads de EventBus emitidos por el engine, y como campo
+  //              datos.modo_operativo + mención en resumen en las 2
+  //              observaciones que el engine guarda en la memoria de Isaías.
+  //              state.calculado.modo_operativo se mantiene como única
+  //              fuente de verdad; el fallback 'rutinario' se aplica solo
+  //              al momento de emitir, nunca se persiste al state.
+  const ENGINE_VERSION = '16.4.5';
+
+  const UMBRAL_REPROYECCION_HORAS = 0.0083;
+  const MAX_HORAS_SIN_ANCLA = 168;
+  const CONFIANZA_DECAY_K = 0.02;
+
+  // V16.4.0 ADD: tabla de severidad de algas (Mapa Conceptual sec 5.1).
+  // Mapea tipo_alga → nivel de severidad (0–5) para derivar modo_operativo.
+  // 0 = sin impacto, 5 = emergencia máxima.
+  const TABLA_SEVERIDAD_ALGA = Object.freeze({
+    'ninguna':  0,
+    'verde':    3,
+    'mostaza':  3,
+    'rosa':     4,
+    'negra':    5,
+    'multiple': 5,
+    'muriendo': 1
+  });
+
+  const TIPOS_EVENTO = Object.freeze({
+    REGISTRO:            'REGISTRO',
+    DOSIFICACION:        'DOSIFICACION',
+    RETROLAVADO:         'RETROLAVADO',
+    LLENADO:             'LLENADO',
+    VACIADO_PARCIAL:     'VACIADO_PARCIAL',
+    ASPIRADO:            'ASPIRADO',
+    CEPILLADO:           'CEPILLADO',
+    SHOCK:               'SHOCK',
+    FACTORES_EXTERNOS:   'FACTORES_EXTERNOS',
+    // V16.4.0 ADD: evento V17.2 — anclaje de diagnóstico desde bitácora
+    // V16.4.3 FIX BUG-008: valor en MAYÚSCULAS para que toUpperCase() del
+    //   switch en recalcularTrasEvento produzca un match correcto.
+    //   Antes: 'diagnostico_anclado' → toUpperCase() = 'DIAGNOSTICO_ANCLADO' → NO match.
+    //   Ahora: 'DIAGNOSTICO_ANCLADO' → toUpperCase() = 'DIAGNOSTICO_ANCLADO' → match.
+    DIAGNOSTICO_ANCLADO: 'DIAGNOSTICO_ANCLADO'
+  });
+
+  const CLIMA_DEFAULT = Object.freeze({
+    temp_c: 28,
+    uv: 8,
+    humedad: 78,
+    viento_kmh: 15
+  });
+
+  // ─── V16.4.5 ADD: helper de fallback para modo_operativo ─────────────────────
+  // Único punto de aplicación del fallback 'rutinario'. Lee
+  // state.calculado.modo_operativo y, si no existe (alberca recién creada
+  // sin diagnóstico anclado, o state previo a V16.4.0), devuelve 'rutinario'.
+  // El fallback se aplica SOLO al momento de emitir un evento u observación;
+  // NUNCA se persiste al state como valor inventado. Esto preserva la regla
+  // arquitectónica: el engine no inventa modos, solo los expone.
+  //
+  // @param {Object} state - poolState (puede ser null/undefined defensivamente)
+  // @returns {string} clave de modo válida (una de los 8 modos) o 'rutinario'
+  function _modoOperativoEmit(state) {
+    if (state && state.calculado && typeof state.calculado.modo_operativo === 'string'
+        && state.calculado.modo_operativo.trim() !== '') {
+      return state.calculado.modo_operativo;
+    }
+    return 'rutinario';
+  }
+
+  function _horasTranscurridas(desde, hasta) {
+    const t0 = new Date(desde).getTime();
+    const t1 = hasta ? new Date(hasta).getTime() : Date.now();
+    if (isNaN(t0) || isNaN(t1)) return 0;
+    return Math.max(0, (t1 - t0) / (1000 * 60 * 60));
+  }
+
+  function _calcularConfianza(horasDesdeAncla) {
+    const h = Math.max(0, horasDesdeAncla);
+    if (h >= MAX_HORAS_SIN_ANCLA) return 0;
+    return parseFloat(Math.exp(-CONFIANZA_DECAY_K * h).toFixed(4));
+  }
+
+  function _extraerEntorno(gemelo) {
+    const ent = gemelo.entorno_topografico || {};
+    return {
+      horas_sol_efectivas: parseFloat(ent.horas_sol_efectivas) || 0,
+      vientos_dominantes: ent.vientos_dominantes === true,
+      factor_desgasificacion_co2: parseFloat(ent.factor_desgasificacion_co2) || 0
+    };
+  }
+
+  function _extraerPuntoCero(gemelo) {
+    const pzq = gemelo.punto_cero_quimico || {};
+    return {
+      fuente: pzq.fuente || 'Red',
+      ph: parseFloat(pzq.ph) || 7.4,
+      alcalinidad: parseFloat(pzq.alcalinidad) || 100,
+      dureza: parseFloat(pzq.dureza) || 300,
+      tds: parseFloat(pzq.tds) || 800,
+      cianurico: parseFloat(pzq.cianurico) || 0,
+      temperatura: parseFloat(pzq.temperatura_llenado) || 25.0
+    };
+  }
+
+  const ISV_DEFAULT = Object.freeze({
+    isv: 0,
+    estado: 'Desconocido',
+    color: '#999999',
+    pHs: 0,
+    zonaMin: -0.10,
+    zonaMax: 0.30,
+    recomendacion: []
+  });
+
+  function _leerValorISV(isvObj) {
+    if (isvObj == null) return 0;
+    if (typeof isvObj === 'number') return isvObj;
+    if (typeof isvObj === 'object') {
+      if (isvObj.isv != null) return parseFloat(isvObj.isv);
+      if (isvObj.valor != null) return parseFloat(isvObj.valor);
+    }
+    return 0;
+  }
+
+  /**
+   * V16.2: Validación de número finito que preserva cero.
+   */
+  function _numOr(valor, fallback) {
+    if (valor == null) return fallback;
+    const n = parseFloat(valor);
+    return isFinite(n) ? n : fallback;
+  }
+
+  /**
+   * V16.3.2 — NUEVO: Detecta si un campo fue explícitamente incluido
+   * en un registro parcial.
+   *
+   * Lógica:
+   *   - Si el campo no existe en el objeto (undefined) → NO fue medido.
+   *   - Si el campo es null → NO fue medido.
+   *   - Si el campo es una cadena vacía ("") → NO fue medido.
+   *   - Si el campo es 0, "0", 3.5, "7.2", etc. → SÍ fue medido.
+   *
+   * Esto permite distinguir "el técnico no incluyó alcalinidad" de
+   * "el técnico midió alcalinidad = 0" (raro pero posible en agua destilada).
+   *
+   * @param {*} valor - El valor del campo en el registro
+   * @returns {boolean} true si el campo fue medido explícitamente
+   */
+  function _tieneValorExplicito(valor) {
+    if (valor === undefined || valor === null) return false;
+    if (typeof valor === 'string' && valor.trim() === '') return false;
+    const n = parseFloat(valor);
+    return isFinite(n);
+  }
+
+  /**
+   * Función auxiliar para mezcla por reposición de agua.
+   * Delega en Chemistry.calcDilucionReposicion para un parámetro individual.
+   *
+   * V16.2.1: Ahora recibe volumen ACTUAL (no nominal) para que la mezcla
+   * sea físicamente correcta después de una pérdida de agua.
+   *
+   * @param {number} concActual - Concentración actual en ppm
+   * @param {number} volActualM3 - Volumen ACTUAL del agua en el vaso (no el nominal)
+   * @param {number} concLlenado - Concentración del agua de llenado en ppm
+   * @param {number} litrosAgregados - Litros de agua nueva
+   * @returns {number} Nueva concentración
+   */
+  function _mezclarPorReposicion(concActual, volActualM3, concLlenado, litrosAgregados) {
+    const cA = parseFloat(concActual) || 0;
+    const vM3 = parseFloat(volActualM3) || 0;
+    const cL = parseFloat(concLlenado) || 0;
+    const lA = parseFloat(litrosAgregados) || 0;
+
+    if (lA <= 0 || vM3 <= 0) return cA;
+
+    if (window.Chemistry && typeof window.Chemistry.calcDilucionReposicion === 'function') {
+      try {
+        const resultado = window.Chemistry.calcDilucionReposicion(cA, vM3, cL, lA);
+        if (resultado != null && isFinite(resultado)) return resultado;
+      } catch (err) {
+        console.warn('[Engine] Error en Chemistry.calcDilucionReposicion, usando cálculo directo:', err);
+      }
+    }
+
+    // Fallback: fórmula de mezcla directa
+    const vLlenadoM3 = lA / 1000;
+    const vFinal = vM3 + vLlenadoM3;
+    return parseFloat(((cA * vM3 + cL * vLlenadoM3) / vFinal).toFixed(2));
+  }
+
+  /**
+   * V16.3: Calcula multiplicadores de degradación basados en factores externos
+   * reportados en la bitácora. Estos multiplicadores afectan las tasas
+   * de degradación de cloro y drift de pH en proyectarEstadoActual.
+   *
+   * @param {Object} factores - Checkboxes/valores de factores externos
+   * @param {boolean} factores.evento_norte - Evento de Norte / viento fuerte
+   * @param {boolean} factores.lluvia - Lluvia intensa reciente
+   * @param {boolean} factores.pool_party - Pool party / carga alta de bañistas
+   * @param {boolean} factores.hojas - Hojas / materia orgánica excesiva
+   * @param {boolean} factores.jardineria - Evento de jardinería reciente
+   * @param {boolean} factores.arena_mar - Arena de mar en el área
+   * @param {string} factores.intensidad_lluvia - 'ligera'|'moderada'|'intensa'|'tormenta'
+   * @param {string} factores.carga_banistas - '1-3'|'4-8'|'9-15'|'16+'
+   * @param {string} factores.duracion_banistas - '1-2h'|'3-5h'|'6h+'
+   * @returns {Object} Multiplicadores para degradación de cloro y drift de pH
+   */
+  function _calcularMultiplicadoresExternos(factores) {
+    if (!factores || typeof factores !== 'object') {
+      return { cloro: 1.0, ph_drift: 1.0, carga_organica: 0, descripcion: 'Sin factores externos.', factores_activos: 0, timestamp: new Date().toISOString() };
+    }
+
+    let multCloro = 1.0;
+    let multPhDrift = 1.0;
+    let cargaOrganica = 0;
+    const efectos = [];
+
+    if (factores.evento_norte) {
+      multCloro *= 1.3;
+      multPhDrift *= 1.2;
+      cargaOrganica += 0.3;
+      efectos.push('Norte: +30% degradacion Cl, arrastre de materia organica');
+    }
+
+    if (factores.lluvia) {
+      const intensidad = (factores.intensidad_lluvia || 'moderada').toLowerCase();
+      switch (intensidad) {
+        case 'ligera':
+          multCloro *= 1.1; multPhDrift *= 1.1; cargaOrganica += 0.1;
+          efectos.push('Lluvia ligera: dilusion minima');
+          break;
+        case 'moderada':
+          multCloro *= 1.3; multPhDrift *= 1.3; cargaOrganica += 0.3;
+          efectos.push('Lluvia moderada: dilusion y arrastre');
+          break;
+        case 'intensa':
+          multCloro *= 1.6; multPhDrift *= 1.5; cargaOrganica += 0.6;
+          efectos.push('Lluvia intensa: dilusion significativa, caida de ALK probable');
+          break;
+        case 'tormenta':
+          multCloro *= 2.0; multPhDrift *= 1.8; cargaOrganica += 1.0;
+          efectos.push('Tormenta: dilusion critica, verificar ALK y pH obligatorio');
+          break;
+        default:
+          multCloro *= 1.3; multPhDrift *= 1.3; cargaOrganica += 0.3;
+          efectos.push('Lluvia (intensidad no especificada): dilusion moderada asumida');
+      }
+    }
+
+    if (factores.pool_party) {
+      const carga = (factores.carga_banistas || '4-8').toLowerCase();
+      const duracion = (factores.duracion_banistas || '3-5h').toLowerCase();
+
+      let factorCarga = 1.0;
+      switch (carga) {
+        case '1-3': factorCarga = 0.5; break;
+        case '4-8': factorCarga = 1.0; break;
+        case '9-15': factorCarga = 1.8; break;
+        case '16+': factorCarga = 2.5; break;
+        default: factorCarga = 1.0;
+      }
+
+      let factorDuracion = 1.0;
+      switch (duracion) {
+        case '1-2h': factorDuracion = 0.7; break;
+        case '3-5h': factorDuracion = 1.0; break;
+        case '6h+': factorDuracion = 1.5; break;
+        default: factorDuracion = 1.0;
+      }
+
+      const impactoBanistas = factorCarga * factorDuracion;
+      multCloro *= (1 + impactoBanistas * 0.4);
+      cargaOrganica += impactoBanistas * 0.5;
+      efectos.push('Pool party: +' + (impactoBanistas * 0.4 * 100).toFixed(0) + '% degradacion Cl, carga organica +' + (impactoBanistas * 0.5).toFixed(1) + ' ppm');
+    }
+
+    if (factores.hojas) {
+      multCloro *= 1.4;
+      cargaOrganica += 0.5;
+      efectos.push('Hojas/organica: +40% degradacion Cl, demanda organica +0.5 ppm');
+    }
+
+    if (factores.jardineria) {
+      multCloro *= 1.2;
+      cargaOrganica += 0.4;
+      efectos.push('Jardineria: fosfatos/nitratos, demanda organica +0.4 ppm');
+    }
+
+    if (factores.arena_mar) {
+      multCloro *= 1.1;
+      multPhDrift *= 1.15;
+      efectos.push('Arena de mar: aumento TDS, drift pH +15%');
+    }
+
+    return {
+      cloro: parseFloat(multCloro.toFixed(2)),
+      ph_drift: parseFloat(multPhDrift.toFixed(2)),
+      carga_organica: parseFloat(cargaOrganica.toFixed(2)),
+      descripcion: efectos.length > 0 ? efectos.join('. ') + '.' : 'Sin factores externos.',
+      factores_activos: efectos.length,
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // V16.4.0 ADD / V16.4.2 FIX BUG-001:
+  // Derivador de modo_operativo según tabla V17.2 sec 5.2 /
+  // Mapa Conceptual sec 10. ORDEN ESTRICTO: primera regla que
+  // aplique gana. Regla 1 (metales) es HARD-STOP irrevocable.
+  //
+  // V16.4.2 — Guardas defensivas en todos los parámetros de entrada:
+  //   - tipoServicio    : string normalizada a minúsculas; null/undefined → ''
+  //   - naturalezaColor : string normalizada; null/undefined → 'ninguna'
+  //   - claridadActual  : parseInt con fallback explícito a 0 si NaN
+  //   - tipoAlga        : lookup en TABLA_SEVERIDAD_ALGA; clave inválida → 0
+  //   Esto elimina el cortocircuito silencioso a 'rutinario' que ocurría
+  //   cuando tipoAlga era undefined (TABLA[undefined] = undefined →
+  //   Math.max(n, undefined) = NaN → todas las comparaciones de severidad
+  //   son false → se saltaba directo al default).
+  //
+  // @param {string}      tipoServicio     - Valor del selector de tipo de servicio
+  // @param {string}      naturalezaColor  - 'ninguna'|'algas'|'metales'|'mixto'
+  // @param {number|string} claridadActual - Nivel 0-6 de claridad visual
+  // @param {string}      tipoAlga         - Clave de TABLA_SEVERIDAD_ALGA
+  // @param {number|null} ispb             - ISPB actual (reservado para uso futuro)
+  // @returns {string} Clave de modo_operativo
+  // ══════════════════════════════════════════════════════════
+  function _calcularModoOperativo(tipoServicio, naturalezaColor, claridadActual, tipoAlga, ispb) {
+    // ── V16.4.2 FIX BUG-001: normalización defensiva de entradas ────────────
+    // Sin estas guardas, un undefined en cualquier parámetro clave puede
+    // producir NaN en sevMax y hacer que TODAS las comparaciones de severidad
+    // fallen silenciosamente, colapsando hacia 'rutinario' de forma incorrecta.
+
+    // Regla 1 evaluada primero, antes de cualquier aritmética, para garantizar
+    // que el HARD-STOP nunca sea bloqueado por un NaN aguas abajo.
+    const natColor = (typeof naturalezaColor === 'string' && naturalezaColor.trim() !== '')
+      ? naturalezaColor.trim().toLowerCase()
+      : 'ninguna';
+
+    // HARD-STOP — Regla 1: metales. Ninguna otra regla puede sobreescribir esto.
+    if (natColor === 'metales') return 'metales';
+
+    // Normalizar tipoServicio: null/undefined/no-string → cadena vacía.
+    const tServ = (typeof tipoServicio === 'string') ? tipoServicio.trim() : '';
+
+    // Reglas 2-4: tipo de servicio explícito (antes de calcular severidad,
+    // porque estos servicios tienen prioridad sobre el nivel de alga).
+    if (tServ === 'post_choque_slam') return 'post_choque';
+    if (tServ === 'correccion_sarro') return 'sarro_controlado';
+    if (tServ === 'algas')            return 'rescate';
+
+    // Calcular severidad_max = max(claridad_actual, TABLA_SEVERIDAD_ALGA[tipo_alga]).
+    // claridadActual: parseInt puede devolver NaN si recibe undefined/null/'';
+    //   en ese caso se usa 0 (sin impacto visual).
+    const claridadParsed = parseInt(claridadActual, 10);
+    const sevNivel = isNaN(claridadParsed)
+      ? 0
+      : Math.max(0, Math.min(6, claridadParsed));
+
+    // tipoAlga: si no existe en la tabla (clave inválida, undefined o null),
+    //   sevAlga = 0. Esto evita Math.max(n, undefined) → NaN.
+    const claveAlga = (typeof tipoAlga === 'string') ? tipoAlga.trim() : '';
+    const sevAlga = (TABLA_SEVERIDAD_ALGA[claveAlga] !== undefined)
+      ? TABLA_SEVERIDAD_ALGA[claveAlga]
+      : 0;
+
+    // sevMax está garantizado como un número finito ≥ 0.
+    const sevMax = Math.max(sevNivel, sevAlga);
+
+    // Regla 5: agua con severidad crítica → rescate inmediato.
+    if (sevMax >= 4) return 'rescate';
+
+    // Regla 6: severidad alta pero tratable.
+    if (sevMax === 3) return 'recuperacion_severa';
+
+    // Regla 7: severidad baja — agua deteriorada pero manejable.
+    if (sevMax === 1 || sevMax === 2) return 'recuperacion_leve';
+
+    // sevMax === 0: agua en buen estado visual, sin algas significativas.
+    // Continuar evaluando tipo de servicio explícito.
+
+    // Regla 8: balance químico de mantenimiento.
+    if (tServ === 'balance_quimico') return 'balance';
+
+    // Default — Regla 9: servicio rutinario, todo dentro de rangos.
+    return 'rutinario';
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // V16.4.0 ADD: factor de desgasificación dinámico (E9, E10, Cirugía 2)
+  // Combina el factor base del expediente con la agitación real
+  // reportada en el último servicio. La agitación residual decae
+  // exponencialmente con vida media ~12h (los hidrojets dejan
+  // burbujas residuales que siguen desgasificando un rato).
+  //
+  // @param {Object} alberca           - Objeto de alberca (gemelo)
+  // @param {Object|null} ultimoServicio - Último servicio guardado
+  // @param {number} horasDesdeServicio  - Horas transcurridas desde ese servicio
+  // @returns {number} Factor de desgasificación combinado
+  // ══════════════════════════════════════════════════════════
+  function _calcularFactorDesgasificacionDinamico(alberca, ultimoServicio, horasDesdeServicio) {
+    const factorBase = (alberca && alberca.entorno_topografico)
+      ? (parseFloat(alberca.entorno_topografico.factor_desgasificacion_co2) || 1.0)
+      : 1.0;
+
+    // Sin servicio reciente → solo factor base
+    if (!ultimoServicio || !ultimoServicio.tiempos_operacion) return factorBase;
+
+    const horasJets    = parseFloat(ultimoServicio.tiempos_operacion.horas_hidrojets) || 0;
+    // V16.4.0 NOTA: bitacora.js V16.7 usa horas_cascadas (plural); V17.2 normaliza a horas_cascada
+    // Se leen ambas claves para compatibilidad hacia atrás.
+    const horasCascada = parseFloat(
+      ultimoServicio.tiempos_operacion.horas_cascada ||
+      ultimoServicio.tiempos_operacion.horas_cascadas
+    ) || 0;
+    const horasAgitacionTotal = horasJets + horasCascada;
+
+    if (horasAgitacionTotal <= 0) return factorBase;
+
+    // Cada hora de hidrojet/cascada aporta +0.5 al factor base, con
+    // decaimiento exponencial. Vida media 12h (lambda = ln(2)/12 ≈ 0.0578/h).
+    const aportePicoAgitacion = horasAgitacionTotal * 0.5;
+    const aporteResidual = aportePicoAgitacion * Math.exp(-0.0578 * (horasDesdeServicio || 0));
+
+    return parseFloat((factorBase + aporteResidual).toFixed(2));
+  }
+
+  function _crearPoolStateInicial(poolId, gemelo) {
+    const pzq = _extraerPuntoCero(gemelo);
+    const entorno = _extraerEntorno(gemelo);
+    const now = new Date().toISOString();
+    const volNominal = parseFloat(gemelo.geometria_adn?.volumen_m3) || 0;
+
+    const parametros = {
+      cloro_libre: 0,
+      ph: pzq.ph,
+      alcalinidad: pzq.alcalinidad,
+      dureza_calcica: pzq.dureza,
+      cianurico: pzq.cianurico,
+      tds: pzq.tds,
+      temperatura: pzq.temperatura
+    };
+
+    let isv = { ...ISV_DEFAULT };
+    if (window.Chemistry && typeof window.Chemistry.calcISV === 'function') {
+      try {
+        const resultado = window.Chemistry.calcISV({
+          ph: parametros.ph,
+          temperatura: parametros.temperatura,
+          dureza: parametros.dureza_calcica,
+          alcalinidad: parametros.alcalinidad,
+          cianurico: parametros.cianurico,
+          tds: parametros.tds
+        });
+        if (resultado) isv = resultado;
+      } catch (err) {
+        console.error('[Engine._crearPoolStateInicial] Error en Chemistry.calcISV:', err);
+      }
+    }
+
+    return {
+      poolId,
+      timestamp: now,
+      ancla_timestamp: now,
+      origen: 'PUNTO_CERO',
+      parametros,
+      calculado: {
+        isv,
+        horas_desde_ancla: 0,
+        horas_desde_calculo: 0,
+        confianza: 1.0,
+        degradacion_aplicada: false
+      },
+      entorno_snapshot: entorno,
+      clima_snapshot: { ...CLIMA_DEFAULT },
+      volumen_m3: volNominal,
+      volumen_actual_m3: volNominal,
+      _multiplicadores_externos: null,
+      _factores_reportados: null,
+      _factores_timestamp: null,
+      _factor_sombra_uv: null,
+      _lastUpdated: now
+    };
+  }
+
+  function _verificarDependencias(requireChemistry = true) {
+    const missing = [];
+    if (!window.EventBus) missing.push('window.EventBus');
+    if (!window.DB) missing.push('window.DB');
+    if (requireChemistry && !window.Chemistry) missing.push('window.Chemistry');
+    if (!window.Clima) missing.push('window.Clima');
+    // Solar es opcional — no se reporta como faltante, solo se informa
+    if (!window.Solar) {
+      console.info('[Engine] window.Solar no detectado. UV se usara sin ajuste de sombra.');
+    }
+    return { ok: missing.length === 0, missing };
+  }
+
+  // Alias internos para que el listener de init() pueda llamar a
+  // proyectarEstadoActual y recalcularTrasEvento sin pasar por window.Engine
+  // (por si el objeto Engine aún no está completamente congelado en el
+  // momento del call).
+  // V16.4.4: proyectarEstadoActual ahora propaga opciones para soportar { forzar }.
+  function proyectarEstadoActual(poolId, opciones) {
+    return Engine.proyectarEstadoActual(poolId, opciones);
+  }
+
+  function recalcularTrasEvento(poolId, tipoEvento, datosEvento) {
+    return Engine.recalcularTrasEvento(poolId, tipoEvento, datosEvento);
+  }
+
+  const Engine = Object.freeze({
+    TIPOS_EVENTO,
+
+    init() {
+      const deps = _verificarDependencias(true);
+      if (!deps.ok) {
+        console.warn(`[Engine.init] DEPENDENCIAS FALTANTES: ${deps.missing.join(', ')}.`);
+      }
+
+      window.EventBus.on('registro:nuevo', (payload) => {
+        if (!payload || !payload.poolId) return;
+        try {
+          Engine.recalcularTrasEvento(payload.poolId, TIPOS_EVENTO.REGISTRO, payload);
+        } catch (err) {
+          console.error('[Engine] Error en registro:nuevo handler:', err);
+        }
+      });
+
+      window.EventBus.on('bitacora:guardada', (payload) => {
+        if (!payload || !payload.poolId) return;
+        const tipoEvento = (payload.tipo || payload.tipoEvento || 'DESCONOCIDO').toUpperCase();
+        try {
+          Engine.recalcularTrasEvento(payload.poolId, tipoEvento, payload);
+        } catch (err) {
+          console.error('[Engine] Error en bitacora:guardada handler:', err);
+        }
+      });
+
+      // ══════════════════════════════════════════════════════════
+      // V16.4.0 ADD / V16.4.2 FIX BUG-007 / V16.4.4 FIX BUG-009:
+      //
+      // Listener para 'bitacora:diagnostico_anclado'.
+      //
+      // Flujo en V16.4.1 (defectuoso para BUG-007):
+      //   Solo llamaba a recalcularTrasEvento() → persistía modo_operativo
+      //   en el state, pero la física de degradación (cloro, pH, UV) NO
+      //   se actualizaba porque recalcularTrasEvento no ejecuta proyecciones.
+      //   El modo recién calculado quedaba "huérfano" hasta la próxima
+      //   proyección periódica de 5 min.
+      //
+      // Flujo en V16.4.2/V16.4.3 (correcto pero peligroso):
+      //   Forzaba la reproyección poniendo state.timestamp = epoch (1970).
+      //   Eso saltaba el guard pero hacía que proyectarEstadoActual integrara
+      //   ~56 años de evaporación/desgasificación → BUG-009.
+      //
+      // Flujo en V16.4.4 (correcto y seguro):
+      //   1. recalcularTrasEvento() — ancla claridad_actual, equipo_snapshot,
+      //      agua_origen_servicio y recalcula modo_operativo en poolState.
+      //   2. proyectarEstadoActual(..., { forzar: true }) — salta el guard
+      //      de UMBRAL_REPROYECCION_HORAS sin tocar el timestamp real.
+      //      La integración usa horasDesdeEstado real (segundos), no 56 años.
+      //
+      // Orden garantizado: recalcular ANTES de proyectar, porque proyectar
+      // lee state.calculado del DB que recalcular acaba de escribir.
+      //
+      // proyectarEstadoActual es async; se llama sin await para no bloquear
+      // el hilo del EventBus. Errores se capturan en el catch interno de la
+      // propia función y en el warn de este handler.
+      // ══════════════════════════════════════════════════════════
+      window.EventBus.on('bitacora:diagnostico_anclado', function(data) {
+        if (!data || !data.poolId) return;
+        try {
+          // Paso 1: anclar diagnóstico en poolState.calculado.
+          // ── V16.4.2: usa alias interno recalcularTrasEvento(), no Engine.recalcularTrasEvento()
+          recalcularTrasEvento(
+            data.poolId,
+            TIPOS_EVENTO.DIAGNOSTICO_ANCLADO,
+            data
+          );
+          console.log('[Engine] DIAGNOSTICO_ANCLADO anclado en state para', data.poolId);
+        } catch (e) {
+          console.warn('[Engine] Error en bitacora:diagnostico_anclado (recalcular):', e);
+        }
+        try {
+          // V16.4.4 BUG-009: reemplaza el truco de envenenar state.timestamp
+          // con epoch. Ese truco hacía que proyectarEstadoActual corriera
+          // con 56 años de horas integradas, disparando TDS, pH y cloro a
+          // valores absurdos. El flag { forzar: true } salta el guard sin
+          // tocar el timestamp real.
+          proyectarEstadoActual(data.poolId, { forzar: true });
+        } catch(e) {
+          console.warn('[Engine] Error en bitacora:diagnostico_anclado (proyectar):', e);
+        }
+      });
+
+      window.EventBus.dispatch('engine:initialized', {
+        timestamp: new Date().toISOString(),
+        chemistryDisponible: !!window.Chemistry,
+        solarDisponible: !!window.Solar,
+        modo: window.Chemistry ? 'COMPLETO' : 'LIMITADO'
+      });
+
+      console.log(`[Engine.init] Inicializado V${ENGINE_VERSION}. Chemistry: ${!!window.Chemistry}, Solar: ${!!window.Solar}`);
+      return true;
+    },
+
+    // V16.4.4 BUG-009: acepta segundo parámetro opciones = { forzar: boolean }.
+    //   Cuando forzar === true, salta el guard de UMBRAL_REPROYECCION_HORAS
+    //   sin necesidad de envenenar state.timestamp. Esto preserva el dato
+    //   real de horasDesdeEstado y evita integrar décadas de física en una
+    //   sola pasada cuando un caller necesita reproyección inmediata.
+    async proyectarEstadoActual(poolId, opciones) {
+      opciones = opciones || {};
+      const forzar = (opciones.forzar === true);
+
+      if (!poolId) return null;
+
+      const gemelo = window.DB.getAlberca(poolId);
+      if (!gemelo) return null;
+
+      const ultimoRegistro = window.DB.getUltimoRegistro(poolId);
+      let state = window.DB.getPoolState(poolId);
+
+      if (!state) {
+        state = _crearPoolStateInicial(poolId, gemelo);
+        if (ultimoRegistro && ultimoRegistro.parametros) {
+          const rp = ultimoRegistro.parametros;
+          state.parametros.cloro_libre    = _numOr(rp.cloro_libre,    state.parametros.cloro_libre);
+          state.parametros.ph             = _numOr(rp.ph,             state.parametros.ph);
+          state.parametros.alcalinidad    = _numOr(rp.alcalinidad,    state.parametros.alcalinidad);
+          state.parametros.dureza_calcica = _numOr(rp.dureza_calcica, state.parametros.dureza_calcica);
+          state.parametros.cianurico      = _numOr(rp.cianurico,      state.parametros.cianurico);
+          state.parametros.tds            = _numOr(rp.tds,            state.parametros.tds);
+          state.parametros.temperatura    = _numOr(rp.temperatura,    state.parametros.temperatura);
+          state.ancla_timestamp = ultimoRegistro.timestamp;
+          state.origen = 'REGISTRO_INICIAL';
+        }
+        window.DB.savePoolState(poolId, state);
+      }
+
+      // V16.2.1: Migración suave — si el state existente no tiene volumen_actual_m3,
+      // inicializarlo al volumen nominal para compatibilidad con states pre-V16.2.1
+      const volNominal = parseFloat(gemelo.geometria_adn?.volumen_m3) || 0;
+      if (state.volumen_actual_m3 == null) {
+        state.volumen_actual_m3 = state.volumen_m3 || volNominal;
+      }
+
+      const now = new Date().toISOString();
+      const horasDesdeEstado = _horasTranscurridas(state.timestamp, now);
+      const horasDesdeAncla  = _horasTranscurridas(state.ancla_timestamp, now);
+
+      // V16.4.4 BUG-009: el guard ahora se salta cuando forzar === true.
+      // Esto reemplaza el hack anterior de envenenar state.timestamp con epoch.
+      if (!forzar && horasDesdeEstado < UMBRAL_REPROYECCION_HORAS) {
+        // V16.4.5 BUG-010: incluir modo_operativo plano también en la rama
+        // cache. Aunque la regla de la sala B menciona "los 4 payloads",
+        // esta rama es parte del mismo evento poolState:updated y la UI
+        // depende de que el campo viaje SIEMPRE que se emita el evento.
+        // Sin esto, una proyección reciente (<30s) emitiría poolState:updated
+        // sin modo_operativo y rompería el banner momentáneamente.
+        window.EventBus.dispatch('poolState:updated', {
+          poolId,
+          state,
+          modo_operativo: _modoOperativoEmit(state),
+          source: 'engine:proyectarEstadoActual:cache',
+          timestamp: now
+        });
+        return state;
+      }
+
+      // V16.4.4 BUG-009: cap defensivo. Aunque otra parte del código ponga
+      // un timestamp envenenado (epoch o muy viejo), nunca proyectamos más
+      // allá del horizonte sano de una semana.
+      const horasParaIntegrar = Math.min(horasDesdeEstado, MAX_HORAS_SIN_ANCLA);
+
+      // ── Obtener Clima Real ──
+      let datosClima = { ...CLIMA_DEFAULT };
+      try {
+        const lat = gemelo.metadata?.ubicacion?.lat || 19.1738;
+        const lng = gemelo.metadata?.ubicacion?.lng || -96.1342;
+        if (window.Clima && typeof window.Clima.obtenerClimaActual === 'function') {
+          const climaReal = await window.Clima.obtenerClimaActual(lat, lng);
+          if (climaReal) datosClima = climaReal;
+        }
+      } catch (err) {
+        console.warn('[Engine] Error al obtener clima real, usando defaults.', err);
+      }
+
+      // ══════════════════════════════════════════════════════════
+      //  V16.3.1: FACTOR DE SOMBRA UV (Solar.js)
+      //
+      //  Calcula qué fracción del UV crudo realmente impacta la
+      //  superficie de la alberca, considerando bardas y árboles.
+      //  Modo inteligente: instantáneo para <4h, diario para >4h.
+      //  Si Solar.js no está cargado, factorSombraUV = 1.0 (sin ajuste).
+      // ══════════════════════════════════════════════════════════
+      let factorSombraUV = 1.0;
+      let factorSombraDetalle = null;
+      if (window.Solar && typeof window.Solar.calcFactorSombraEfectivo === 'function') {
+        try {
+          const resultadoSombra = window.Solar.calcFactorSombraEfectivo(gemelo, {
+            modo: horasDesdeEstado > 4 ? 'diario' : 'instantaneo',
+            fecha: new Date()
+          });
+          if (resultadoSombra && isFinite(resultadoSombra.factorUV)) {
+            factorSombraUV = resultadoSombra.factorUV;
+            factorSombraDetalle = {
+              factorUV: resultadoSombra.factorUV,
+              modo: resultadoSombra.modo,
+              horasSolEfectivas: resultadoSombra.horasSolEfectivas || null
+            };
+            console.debug(`[Engine] Factor sombra UV: ${factorSombraUV} (modo: ${resultadoSombra.modo})`);
+          }
+        } catch (err) {
+          console.warn('[Engine] Error en Solar.calcFactorSombraEfectivo, UV sin ajuste de sombra:', err);
+        }
+      }
+
+      const entorno   = _extraerEntorno(gemelo);
+      const p         = { ...state.parametros };
+      const volActual = parseFloat(state.volumen_actual_m3) || volNominal;
+
+      // ── DELEGAR: Degradación de Cloro y Evaporación ──
+      // V16.4.4 BUG-009: los cálculos físicos usan horasParaIntegrar (capeado),
+      //   no horasDesdeEstado. El logging y el campo final horas_desde_calculo
+      //   del nuevoState siguen usando horasDesdeEstado (dato real).
+      if (window.Chemistry) {
+        try {
+          // V16.3: Multiplicadores de factores externos (si existen en el state)
+          const multExtCloro = (state._multiplicadores_externos && state._multiplicadores_externos.cloro)
+            ? state._multiplicadores_externos.cloro : 1.0;
+          const cargaOrgExt = (state._multiplicadores_externos && state._multiplicadores_externos.carga_organica)
+            ? state._multiplicadores_externos.carga_organica : 0;
+
+          // V16.3.1: UV efectivo = UV crudo × factor de sombra
+          const uvEfectivo = (datosClima.uv || 0) * factorSombraUV;
+
+          // V16.4.0 ADD: leer albedo del recubrimiento (Cirugía C — D1).
+          // Lee desde alberca.geometria_adn.recubrimiento.albedo_refractivo.
+          const albedoRecub = (gemelo && gemelo.geometria_adn &&
+                               gemelo.geometria_adn.recubrimiento)
+                               ? parseFloat(gemelo.geometria_adn.recubrimiento.albedo_refractivo)
+                               : null;
+
+          // Degradación base delegada a Chemistry
+          const cloroAntes = parseFloat(p.cloro_libre) || 0;
+          const cloroBase  = window.Chemistry.calcDegradacionCloro(
+            cloroAntes,
+            horasParaIntegrar,
+            uvEfectivo,
+            parseFloat(p.cianurico) || 0,
+            datosClima.temp_c,
+            albedoRecub  // V16.4.0 ADD: nuevo parámetro
+          );
+
+          // Aplicar multiplicador de factores externos sobre la pérdida
+          const cloroPerdidoBase     = cloroAntes - cloroBase;
+          const cloroPerdidoAjustado = cloroPerdidoBase * multExtCloro;
+
+          // Carga orgánica: demanda adicional de cloro que decae con vida media ~24h
+          const cargaOrgResidual = cargaOrgExt * Math.exp(-0.03 * horasParaIntegrar);
+          const demandaOrganica  = cargaOrgResidual * (horasParaIntegrar / 24);
+
+          p.cloro_libre = parseFloat(Math.max(0,
+            cloroAntes - cloroPerdidoAjustado - demandaOrganica
+          ).toFixed(2));
+        } catch (err) {
+          console.warn('[Engine] Error en calcDegradacionCloro:', err);
+        }
+
+        try {
+          const multExtPhDrift = (state._multiplicadores_externos && state._multiplicadores_externos.ph_drift)
+            ? state._multiplicadores_externos.ph_drift : 1.0;
+
+          // V16.4.0 MOD: factor de desgasificación dinámico (E9, E10, Cirugía 2).
+          // Reemplaza el estático del expediente por el calculado con
+          // horas reales de agitación del último servicio.
+          // V16.4.0 NOTA: si DB.getUltimoServicio no existe, fallback al
+          // factor estático del expediente. Sala futura debe agregar
+          // ese helper en db.js.
+          let factorDesgasDinamico = entorno.factor_desgasificacion_co2; // fallback estático
+          if (window.DB && typeof window.DB.getUltimoServicio === 'function') {
+            const ultimoServicio = window.DB.getUltimoServicio(poolId);
+            const horasDesdeUltimoServ = ultimoServicio
+              ? _horasTranscurridas(ultimoServicio.timestamp, now)
+              : 999;
+            factorDesgasDinamico = _calcularFactorDesgasificacionDinamico(
+              gemelo, ultimoServicio, horasDesdeUltimoServ
+            );
+          } else {
+            console.warn('[Engine] DB.getUltimoServicio no disponible. ' +
+              'Usando factor_desgasificacion_co2 estático del expediente. ' +
+              'V16.4.0: agregar DB.getUltimoServicio en db.js para activar dinámica de CO2.');
+          }
+
+          const deltaPh = window.Chemistry.calcDeltaPhDesgasificacion(
+            parseFloat(p.ph) || 7.4,
+            horasParaIntegrar,
+            parseFloat(p.alcalinidad) || 100,
+            factorDesgasDinamico  // V16.4.0 MOD: dinámico, ya no estático
+          );
+
+          const deltaPhAjustado = (parseFloat(deltaPh) || 0) * multExtPhDrift;
+
+          p.ph = parseFloat(((parseFloat(p.ph) || 7.4) + deltaPhAjustado).toFixed(2));
+        } catch (err) {
+          console.warn('[Engine] Error en calcDeltaPhDesgasificacion:', err);
+        }
+
+        // Evaporación: TDS se concentra porque el solvente se va pero el soluto queda.
+        // V16.2.1: Usar volumen_actual como base, no el nominal.
+        const factorEvap = (datosClima.temp_c / 25) * (1 + (100 - datosClima.humedad) / 100) * (1 + datosClima.viento_kmh / 50);
+        try {
+          const litrosEvaporados = factorEvap * horasParaIntegrar * 2;
+          if (typeof window.Chemistry.calcConcentracionPostEvaporacion === 'function') {
+            p.tds = window.Chemistry.calcConcentracionPostEvaporacion(
+              p.tds,
+              volActual,
+              litrosEvaporados
+            );
+          }
+        } catch (e) {
+          console.warn('[Engine] Error en calcConcentracionPostEvaporacion:', e);
+        }
+      }
+
+      // ── ISV delegado a Chemistry ──
+      let isv = state.calculado?.isv || { ...ISV_DEFAULT };
+      if (window.Chemistry && typeof window.Chemistry.calcISV === 'function') {
+        try {
+          const resultado = window.Chemistry.calcISV({
+            ph: p.ph,
+            temperatura: datosClima.temp_c,
+            dureza: p.dureza_calcica,
+            alcalinidad: p.alcalinidad,
+            cianurico: p.cianurico,
+            tds: p.tds
+          });
+          if (resultado) isv = resultado;
+        } catch (err) {
+          console.error('[Engine.proyectar] Error en Chemistry.calcISV:', err);
+        }
+      }
+
+      const confianza = _calcularConfianza(horasDesdeAncla);
+
+      // ── Decaimiento de multiplicadores externos ──
+      // Los factores externos pierden efecto con el tiempo.
+      // Vida media: 48 horas (k=0.015). Después de 7 días, efecto residual menor al 5%.
+      let multiplicadoresActualizados     = null;
+      let factoresReportadosActualizados  = null;
+      let factoresTimestampActualizado    = null;
+
+      if (state._multiplicadores_externos && state._factores_timestamp) {
+        const horasDesdeFactores = _horasTranscurridas(state._factores_timestamp, now);
+        const decaimiento = Math.exp(-0.015 * horasDesdeFactores);
+
+        if (decaimiento > 0.05) {
+          multiplicadoresActualizados = {
+            cloro: parseFloat((1 + (state._multiplicadores_externos.cloro - 1) * decaimiento).toFixed(3)),
+            ph_drift: parseFloat((1 + (state._multiplicadores_externos.ph_drift - 1) * decaimiento).toFixed(3)),
+            carga_organica: parseFloat((state._multiplicadores_externos.carga_organica * decaimiento).toFixed(3)),
+            descripcion: state._multiplicadores_externos.descripcion,
+            factores_activos: state._multiplicadores_externos.factores_activos,
+            decaimiento_actual: parseFloat(decaimiento.toFixed(3)),
+            timestamp: state._multiplicadores_externos.timestamp
+          };
+          factoresReportadosActualizados = state._factores_reportados;
+          factoresTimestampActualizado   = state._factores_timestamp;
+        }
+        // else: las tres variables quedan null, eliminando los multiplicadores del state
+      }
+
+      const nuevoState = {
+        poolId,
+        timestamp: now,
+        ancla_timestamp: state.ancla_timestamp,
+        origen: state.origen,
+        parametros: p,
+        calculado: {
+          ...state.calculado,  // V16.4.1: simetría con recalcularTrasEvento — preservar modo_operativo, claridad_actual, equipo_snapshot, agua_origen_servicio, protocolo_operativo, bloqueo_cloracion (Mapa Conceptual sec 11)
+          isv,
+          horas_desde_ancla: parseFloat(horasDesdeAncla.toFixed(2)),
+          horas_desde_calculo: parseFloat(horasDesdeEstado.toFixed(2)), // V16.4.4: dato real, NO capeado
+          confianza,
+          degradacion_aplicada: true
+        },
+        entorno_snapshot: entorno,
+        clima_snapshot: datosClima,
+        volumen_m3: volNominal,
+        volumen_actual_m3: volActual,
+        _multiplicadores_externos: multiplicadoresActualizados,
+        _factores_reportados: factoresReportadosActualizados,
+        _factores_timestamp: factoresTimestampActualizado,
+        _factor_sombra_uv: factorSombraDetalle,
+        _lastUpdated: now
+      };
+
+      window.DB.savePoolState(poolId, nuevoState);
+
+      // V16.4.5 BUG-010: leer modo_operativo desde el nuevoState ya persistido.
+      // Es la fuente de verdad. Si DIAGNOSTICO_ANCLADO escribió un modo,
+      // estará aquí (porque el spread ...state.calculado lo preserva).
+      // Si nunca se ancló nada, _modoOperativoEmit devuelve 'rutinario'.
+      const modoOpEmit = _modoOperativoEmit(nuevoState);
+
+      // ── V16.3: Registrar observación para Isaías ──
+      // V16.4.5 BUG-010: añadir modo_operativo al objeto datos y mencionarlo
+      //   al final del resumen (formato ", Modo=<modo>").
+      if (window.DB && typeof window.DB.saveIsaiasObservacion === 'function') {
+        try {
+          const obsCloro     = parseFloat(p.cloro_libre) || 0;
+          const obsPh        = parseFloat(p.ph) || 0;
+          const obsIsv       = _leerValorISV(isv);
+          const obsConfianza = confianza;
+          const obsHorasAncla = nuevoState.calculado.horas_desde_ancla;
+
+          const alertasProyeccion = [];
+          if (obsCloro < 0.5) alertasProyeccion.push('Cloro critico: ' + obsCloro + ' ppm');
+          else if (obsCloro < 1.0) alertasProyeccion.push('Cloro bajo: ' + obsCloro + ' ppm');
+          if (obsConfianza < 0.15) alertasProyeccion.push('Confianza critica: ' + (obsConfianza * 100).toFixed(0) + '%');
+          if (Math.abs(obsIsv) > 0.5) alertasProyeccion.push('ISPB fuera de rango: ' + obsIsv);
+
+          const tipoObs = alertasProyeccion.length > 0 ? 'alerta' : 'proyeccion';
+
+          window.DB.saveIsaiasObservacion({
+            tipo: tipoObs,
+            poolId: poolId,
+            resumen: 'Proyeccion: Cl=' + obsCloro + ' ppm, pH=' + obsPh +
+              ', ISPB=' + obsIsv + ', Confianza=' + (obsConfianza * 100).toFixed(0) + '%' +
+              ', SombraUV=' + factorSombraUV.toFixed(2) +
+              (alertasProyeccion.length > 0 ? '. ALERTAS: ' + alertasProyeccion.join('; ') : '') +
+              ', Modo=' + modoOpEmit, // V16.4.5 BUG-010
+            datos: {
+              cloro_libre: obsCloro,
+              ph: obsPh,
+              isv: obsIsv,
+              confianza: obsConfianza,
+              horas_desde_ancla: obsHorasAncla,
+              multiplicadores: nuevoState._multiplicadores_externos,
+              factor_sombra_uv: factorSombraUV,
+              alertas: alertasProyeccion,
+              modo_operativo: modoOpEmit // V16.4.5 BUG-010
+            },
+            procesado: false
+          });
+        } catch (obsErr) {
+          console.warn('[Engine] Error al guardar observacion para Isaias:', obsErr);
+        }
+      }
+
+      // V16.4.5 BUG-010: payload 1 — poolState:updated desde proyectarEstadoActual.
+      // modo_operativo viaja como campo plano en raíz del payload, además de
+      // mantenerse anidado en state.calculado.modo_operativo.
+      window.EventBus.dispatch('poolState:updated', {
+        poolId,
+        state: nuevoState,
+        modo_operativo: modoOpEmit, // V16.4.5 BUG-010
+        source: 'engine:proyectarEstadoActual',
+        timestamp: now
+      });
+
+      // V16.4.5 BUG-010: payload 2 — engine:proyeccion_completada.
+      window.EventBus.dispatch('engine:proyeccion_completada', {
+        poolId,
+        confianza,
+        horas_desde_ancla: nuevoState.calculado.horas_desde_ancla,
+        cloro_libre: p.cloro_libre,
+        ph: p.ph,
+        isv: _leerValorISV(isv),
+        factor_sombra_uv: factorSombraUV,
+        modo_operativo: modoOpEmit, // V16.4.5 BUG-010
+        timestamp: now
+      });
+
+      return nuevoState;
+    },
+
+    recalcularTrasEvento(poolId, tipoEvento, datosEvento) {
+      if (!poolId || !tipoEvento) return null;
+
+      const gemelo = window.DB.getAlberca(poolId);
+      if (!gemelo) return null;
+
+      const now        = new Date().toISOString();
+      const volNominal = parseFloat(gemelo.geometria_adn?.volumen_m3) || 0;
+      const entorno    = _extraerEntorno(gemelo);
+      const puntoCero  = _extraerPuntoCero(gemelo);
+
+      if (volNominal <= 0) {
+        console.warn(`[Engine] ADVERTENCIA: Alberca "${poolId}" tiene volumen = 0 m3. ` +
+          `Los cálculos de dilución/mezcla serán omitidos. Registra las dimensiones en el Expediente.`);
+      }
+
+      let state = window.DB.getPoolState(poolId);
+      if (!state) state = _crearPoolStateInicial(poolId, gemelo);
+
+      // V16.2.1: Migración suave para states pre-existentes
+      if (state.volumen_actual_m3 == null) {
+        state.volumen_actual_m3 = state.volumen_m3 || volNominal;
+      }
+
+      const p = { ...state.parametros };
+      let volActual = parseFloat(state.volumen_actual_m3) || volNominal;
+      const tipo = tipoEvento.toUpperCase();
+
+      switch (tipo) {
+        // ═══════════════════════════════════════════════════════
+        //  V16.3.2 — REGISTRO (Fix Bug 2: registro parcial)
+        //
+        //  Antes: _numOr(rp.campo, p.campo) sobrescribía con 0
+        //  cuando el formulario enviaba campos vacíos como 0.
+        //
+        //  Ahora: _tieneValorExplicito() verifica si el campo fue
+        //  realmente medido. Si no fue incluido en el registro,
+        //  se conserva el valor anterior del state.
+        //
+        //  Esto permite:
+        //  - Ancla Rápida: solo pH y Cloro → ALK, CH, CYA, TDS intactos.
+        //  - ColorQ parcial: si un reactivo se agotó, los demás parámetros
+        //    no desaparecen.
+        //  - Registro completo: funciona igual que antes, todos los
+        //    campos se actualizan.
+        // ═══════════════════════════════════════════════════════
+        case TIPOS_EVENTO.REGISTRO: {
+          const registro = window.DB.getUltimoRegistro(poolId);
+          if (registro && registro.parametros) {
+            const rp = registro.parametros;
+
+            // Solo actualizar cada parámetro si fue explícitamente medido
+            if (_tieneValorExplicito(rp.cloro_libre))    p.cloro_libre    = parseFloat(rp.cloro_libre);
+            if (_tieneValorExplicito(rp.ph))             p.ph             = parseFloat(rp.ph);
+            if (_tieneValorExplicito(rp.alcalinidad))    p.alcalinidad    = parseFloat(rp.alcalinidad);
+            if (_tieneValorExplicito(rp.dureza_calcica)) p.dureza_calcica = parseFloat(rp.dureza_calcica);
+            if (_tieneValorExplicito(rp.cianurico))      p.cianurico      = parseFloat(rp.cianurico);
+            if (_tieneValorExplicito(rp.tds))            p.tds            = parseFloat(rp.tds);
+            if (_tieneValorExplicito(rp.temperatura))    p.temperatura    = parseFloat(rp.temperatura);
+
+            state.ancla_timestamp = registro.timestamp;
+            state.origen = TIPOS_EVENTO.REGISTRO;
+
+            // Log de diagnóstico para campo — qué se actualizó y qué se conservó
+            const actualizados = [];
+            const conservados  = [];
+            ['cloro_libre','ph','alcalinidad','dureza_calcica','cianurico','tds','temperatura'].forEach(k => {
+              if (_tieneValorExplicito(rp[k])) {
+                actualizados.push(k + '=' + parseFloat(rp[k]));
+              } else {
+                conservados.push(k + '=' + p[k] + ' (prev)');
+              }
+            });
+            console.info(`[Engine] REGISTRO parcial procesado. ` +
+              `Actualizados: [${actualizados.join(', ')}]. ` +
+              `Conservados: [${conservados.join(', ')}].`);
+          }
+          // Un registro fresco implica que el técnico midió el agua real.
+          // Si el nivel estaba bajo y se rellenó antes de medir, el técnico
+          // debería haber registrado el llenado primero. Asumimos nivel nominal.
+          volActual = volNominal;
+          break;
+        }
+
+        case TIPOS_EVENTO.DOSIFICACION: {
+          const deltas = datosEvento.deltas || datosEvento.quimicos || {};
+          if (deltas.cloro_libre    !== undefined) p.cloro_libre    = Math.max(0, (parseFloat(p.cloro_libre)    || 0) + parseFloat(deltas.cloro_libre));
+          if (deltas.ph             !== undefined) p.ph             = (parseFloat(p.ph)             || 7.4) + parseFloat(deltas.ph);
+          if (deltas.alcalinidad    !== undefined) p.alcalinidad    = Math.max(0, (parseFloat(p.alcalinidad)    || 0) + parseFloat(deltas.alcalinidad));
+          if (deltas.dureza_calcica !== undefined) p.dureza_calcica = Math.max(0, (parseFloat(p.dureza_calcica) || 0) + parseFloat(deltas.dureza_calcica));
+          if (deltas.cianurico      !== undefined) p.cianurico      = Math.max(0, (parseFloat(p.cianurico)      || 0) + parseFloat(deltas.cianurico));
+          if (deltas.tds            !== undefined) p.tds            = Math.max(0, (parseFloat(p.tds)            || 0) + parseFloat(deltas.tds));
+
+          p.cloro_libre    = parseFloat((p.cloro_libre).toFixed(2));
+          p.ph             = parseFloat((p.ph).toFixed(2));
+          p.alcalinidad    = parseFloat((p.alcalinidad).toFixed(0));
+          p.dureza_calcica = parseFloat((p.dureza_calcica).toFixed(0));
+          p.cianurico      = parseFloat((p.cianurico).toFixed(0));
+          p.tds            = parseFloat((p.tds).toFixed(0));
+
+          state.origen = TIPOS_EVENTO.DOSIFICACION;
+          break;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  V16.2.1 — RETROLAVADO
+        //
+        //  Física correcta: El agua que sale del vaso por retrolavado
+        //  lleva la misma concentración que el vaso. Por lo tanto,
+        //  las concentraciones (ppm) NO cambian. Lo que cambia es
+        //  el VOLUMEN de agua en el vaso.
+        //
+        //  Este volumen reducido será usado por LLENADO para calcular
+        //  la mezcla correcta cuando el técnico reponga el agua.
+        // ═══════════════════════════════════════════════════════
+        case TIPOS_EVENTO.RETROLAVADO: {
+          const litrosPerdidos = parseFloat(datosEvento.litros_perdidos) || 0;
+
+          if (litrosPerdidos > 0 && volActual > 0) {
+            const volPerdidoM3 = litrosPerdidos / 1000;
+            const nuevoVol = Math.max(0, volActual - volPerdidoM3);
+
+            console.info(`[Engine] Retrolavado: ${litrosPerdidos}L perdidos. ` +
+              `Volumen: ${(volActual * 1000).toFixed(0)}L → ${(nuevoVol * 1000).toFixed(0)}L. ` +
+              `Concentraciones sin cambio (Cl: ${p.cloro_libre} ppm, CYA: ${p.cianurico} ppm, ` +
+              `ALK: ${p.alcalinidad} ppm, CH: ${p.dureza_calcica} ppm, TDS: ${p.tds} ppm).`);
+
+            volActual = nuevoVol;
+          }
+
+          state.origen = TIPOS_EVENTO.RETROLAVADO;
+          break;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  V16.2.1 — LLENADO / REPOSICIÓN
+        //
+        //  La mezcla ahora se calcula con volumen_actual_m3
+        //  (que puede ser menor al nominal si hubo retrolavado/vaciado).
+        //  Después del llenado, el volumen se actualiza sumando
+        //  los litros agregados.
+        // ═══════════════════════════════════════════════════════
+        case TIPOS_EVENTO.LLENADO: {
+          const litrosNuevos = parseFloat(datosEvento.litros_agregados) || 0;
+
+          if (litrosNuevos > 0 && volActual > 0) {
+            p.cloro_libre = _mezclarPorReposicion(
+              parseFloat(p.cloro_libre) || 0,
+              volActual,
+              0,
+              litrosNuevos
+            );
+
+            p.ph = parseFloat(_mezclarPorReposicion(
+              parseFloat(p.ph) || 7.4,
+              volActual,
+              puntoCero.ph,
+              litrosNuevos
+            ).toFixed(2));
+
+            p.alcalinidad = parseFloat(_mezclarPorReposicion(
+              parseFloat(p.alcalinidad) || 100,
+              volActual,
+              puntoCero.alcalinidad,
+              litrosNuevos
+            ).toFixed(0));
+
+            p.dureza_calcica = parseFloat(_mezclarPorReposicion(
+              parseFloat(p.dureza_calcica) || 300,
+              volActual,
+              puntoCero.dureza,
+              litrosNuevos
+            ).toFixed(0));
+
+            p.cianurico = parseFloat(_mezclarPorReposicion(
+              parseFloat(p.cianurico) || 0,
+              volActual,
+              puntoCero.cianurico,
+              litrosNuevos
+            ).toFixed(0));
+
+            p.tds = parseFloat(_mezclarPorReposicion(
+              parseFloat(p.tds) || 800,
+              volActual,
+              puntoCero.tds,
+              litrosNuevos
+            ).toFixed(0));
+
+            p.temperatura = parseFloat(_mezclarPorReposicion(
+              parseFloat(p.temperatura) || 25,
+              volActual,
+              puntoCero.temperatura,
+              litrosNuevos
+            ).toFixed(1));
+
+            // Actualizar volumen
+            const litrosNuevosM3 = litrosNuevos / 1000;
+            const nuevoVol = volActual + litrosNuevosM3;
+
+            console.info(`[Engine] Llenado: +${litrosNuevos}L. ` +
+              `Volumen: ${(volActual * 1000).toFixed(0)}L → ${(nuevoVol * 1000).toFixed(0)}L. ` +
+              `Mezcla con punto cero completada.`);
+
+            // No permitir que el volumen supere el nominal (overflow = desbordamiento)
+            volActual = Math.min(nuevoVol, volNominal * 1.05); // 5% de tolerancia
+          }
+
+          state.origen = TIPOS_EVENTO.LLENADO;
+          break;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  V16.2.1 — VACIADO PARCIAL / ASPIRADO
+        //
+        //  Misma física que retrolavado: las concentraciones no
+        //  cambian. Solo se reduce el volumen actual.
+        // ═══════════════════════════════════════════════════════
+        case TIPOS_EVENTO.VACIADO_PARCIAL:
+        case TIPOS_EVENTO.ASPIRADO: {
+          const litrosPerdidos = parseFloat(datosEvento.litros_perdidos) || 0;
+
+          if (litrosPerdidos > 0 && volActual > 0) {
+            const volPerdidoM3 = litrosPerdidos / 1000;
+            const nuevoVol = Math.max(0, volActual - volPerdidoM3);
+
+            console.info(`[Engine] ${tipo}: ${litrosPerdidos}L perdidos. ` +
+              `Volumen: ${(volActual * 1000).toFixed(0)}L → ${(nuevoVol * 1000).toFixed(0)}L. ` +
+              `Concentraciones sin cambio.`);
+
+            volActual = nuevoVol;
+          }
+
+          state.origen = tipo;
+          break;
+        }
+
+        case TIPOS_EVENTO.SHOCK: {
+          const deltas = datosEvento.deltas || {};
+          if (deltas.cloro_libre !== undefined) p.cloro_libre = parseFloat(Math.max(0, (parseFloat(p.cloro_libre) || 0) + parseFloat(deltas.cloro_libre)).toFixed(2));
+          if (deltas.ph         !== undefined) p.ph          = parseFloat(((parseFloat(p.ph) || 7.4) + parseFloat(deltas.ph)).toFixed(2));
+          state.origen = TIPOS_EVENTO.SHOCK;
+          break;
+        }
+
+        case TIPOS_EVENTO.CEPILLADO: {
+          state.origen = TIPOS_EVENTO.CEPILLADO;
+          break;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  V16.3 — FACTORES EXTERNOS
+        //
+        //  Los factores externos no cambian parámetros directamente.
+        //  Modifican los multiplicadores de degradación que se guardan
+        //  en el state para que proyectarEstadoActual los use.
+        // ═══════════════════════════════════════════════════════
+        case TIPOS_EVENTO.FACTORES_EXTERNOS: {
+          const factores = datosEvento.factores || {};
+          const multiplicadores = _calcularMultiplicadoresExternos(factores);
+
+          state._multiplicadores_externos = multiplicadores;
+          state._factores_reportados      = factores;
+          state._factores_timestamp       = now;
+
+          state.origen = TIPOS_EVENTO.FACTORES_EXTERNOS;
+          break;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  V16.4.0 ADD: handler de DIAGNOSTICO_ANCLADO (Cirugía B)
+        //  V16.4.2: El listener de init() llama a proyectarEstadoActual
+        //           DESPUÉS de este case, completando el ciclo BUG-007.
+        //  V16.4.3 FIX BUG-008: el case ahora matchea correctamente porque
+        //           TIPOS_EVENTO.DIAGNOSTICO_ANCLADO = 'DIAGNOSTICO_ANCLADO'
+        //           y tipo = tipoEvento.toUpperCase() produce el mismo valor.
+        //
+        //  Este evento ancla el diagnóstico visual del técnico al
+        //  gemelo digital sin tocar el expediente (salud_inicial).
+        //  Persiste claridad_actual, equipo_snapshot y agua_origen_servicio
+        //  en poolState.calculado. Recalcula modo_operativo.
+        //
+        //  Regla de Oro #11: NO toca alberca.salud_inicial.
+        //  La naturaleza_color='metales' en salud_agua es HARD-STOP
+        //  para el modo operativo (nunca derivan a 'rescate').
+        // ═══════════════════════════════════════════════════════
+        case TIPOS_EVENTO.DIAGNOSTICO_ANCLADO: {
+          const datos = datosEvento || {};
+
+          // 1. Persistir claridad_actual en poolState.calculado
+          //    (NO toca alberca.salud_inicial — Regla de Oro #11)
+          //    V16.4.3 FIX BUG-008: guarda solo el número 0..6, no el
+          //    objeto salud_agua completo.
+          if (datos.salud_agua) {
+            state.calculado = state.calculado || {};
+            state.calculado.claridad_actual           = datos.salud_agua.claridad_actual;
+            state.calculado.claridad_actual_timestamp = now;
+          }
+
+          // 2. Persistir snapshot del estado hidráulico
+          if (datos.estado_hidraulico) {
+            state.calculado.equipo_snapshot           = datos.estado_hidraulico;
+            state.calculado.equipo_snapshot_timestamp = now;
+          }
+
+          // 3. Persistir agua de llenado (snapshot del servicio)
+          if (datos.agua_llenado) {
+            state.calculado.agua_origen_servicio = datos.agua_llenado;
+          }
+
+          // 4. Recalcular modo_operativo con la función corregida (BUG-001).
+          //    Todos los parámetros están ahora normalizados dentro de
+          //    _calcularModoOperativo, por lo que undefined no puede
+          //    colapsarla a 'rutinario'.
+          const modoCalculado = _calcularModoOperativo(
+            datos.tipo_servicio,
+            datos.salud_agua ? datos.salud_agua.naturaleza_color : 'ninguna',
+            datos.salud_agua ? datos.salud_agua.claridad_actual  : 0,
+            datos.tipo_alga || (datos.salud_agua ? datos.salud_agua.tipo_alga : 'ninguna'),
+            state.calculado.isv ? state.calculado.isv.valor : null
+          );
+          state.calculado.modo_operativo           = modoCalculado;
+          state.calculado.modo_operativo_timestamp = now;
+
+          state.origen = TIPOS_EVENTO.DIAGNOSTICO_ANCLADO;
+          break;
+        }
+
+        default: {
+          state.origen = tipo;
+          break;
+        }
+      }
+
+      // ── ISV siempre delegado a Chemistry ──
+      let isv = state.calculado?.isv || { ...ISV_DEFAULT };
+      if (window.Chemistry && typeof window.Chemistry.calcISV === 'function') {
+        try {
+          const resultado = window.Chemistry.calcISV({
+            ph: p.ph,
+            temperatura: p.temperatura,
+            dureza: p.dureza_calcica,
+            alcalinidad: p.alcalinidad,
+            cianurico: p.cianurico,
+            tds: p.tds
+          });
+          if (resultado) isv = resultado;
+        } catch (err) {
+          console.error('[Engine.recalcular] Error en Chemistry.calcISV:', err);
+        }
+      }
+
+      const horasDesdeAncla = _horasTranscurridas(state.ancla_timestamp, now);
+      const confianza = tipo === TIPOS_EVENTO.REGISTRO ? 1.0 : _calcularConfianza(horasDesdeAncla);
+
+      const nuevoState = {
+        poolId,
+        timestamp: now,
+        ancla_timestamp: state.ancla_timestamp,
+        origen: state.origen,
+        parametros: p,
+        calculado: {
+          ...state.calculado,  // V16.4.0: preservar campos calculados anclados (modo_operativo, claridad_actual, etc.)
+          isv,
+          horas_desde_ancla:   parseFloat(horasDesdeAncla.toFixed(2)),
+          horas_desde_calculo: 0,
+          confianza,
+          degradacion_aplicada: false,
+          ultimo_evento: tipo
+        },
+        entorno_snapshot: entorno,
+        clima_snapshot: state.clima_snapshot || { ...CLIMA_DEFAULT },
+        volumen_m3: volNominal,
+        volumen_actual_m3: volActual,
+        _multiplicadores_externos: state._multiplicadores_externos || null,
+        _factores_reportados:      state._factores_reportados      || null,
+        _factores_timestamp:       state._factores_timestamp       || null,
+        _factor_sombra_uv:         state._factor_sombra_uv         || null,
+        _lastUpdated: now
+      };
+
+      window.DB.savePoolState(poolId, nuevoState);
+
+      // V16.4.5 BUG-010: leer modo_operativo desde el nuevoState ya persistido.
+      // En el caso DIAGNOSTICO_ANCLADO el modo acaba de calcularse y guardarse;
+      // en los demás casos se preserva el modo previo gracias al spread
+      // ...state.calculado. Si no hay modo, _modoOperativoEmit devuelve
+      // 'rutinario' como fallback al momento de emitir.
+      const modoOpEmit = _modoOperativoEmit(nuevoState);
+
+      // ── V16.3: Registrar observación para Isaías ──
+      // V16.4.5 BUG-010: añadir modo_operativo al objeto datos y mencionarlo
+      //   al final del resumen (formato ", Modo=<modo>").
+      if (window.DB && typeof window.DB.saveIsaiasObservacion === 'function') {
+        try {
+          const obsIsvRecalc = _leerValorISV(nuevoState.calculado.isv);
+
+          window.DB.saveIsaiasObservacion({
+            tipo: 'bitacora',
+            poolId: poolId,
+            resumen: 'Evento ' + tipo + ': Cl=' + nuevoState.parametros.cloro_libre + ' ppm, pH=' + nuevoState.parametros.ph +
+              ', ISPB=' + obsIsvRecalc + ', Vol=' + (volActual * 1000).toFixed(0) + 'L' +
+              ', Modo=' + modoOpEmit, // V16.4.5 BUG-010
+            datos: {
+              evento:            tipo,
+              cloro_libre:       nuevoState.parametros.cloro_libre,
+              ph:                nuevoState.parametros.ph,
+              isv:               obsIsvRecalc,
+              confianza:         nuevoState.calculado.confianza,
+              volumen_actual_m3: volActual,
+              datos_evento:      datosEvento,
+              modo_operativo:    modoOpEmit // V16.4.5 BUG-010
+            },
+            procesado: false
+          });
+        } catch (obsErr) {
+          console.warn('[Engine] Error al guardar observacion para Isaias:', obsErr);
+        }
+      }
+
+      // V16.4.5 BUG-010: payload 3 — poolState:updated desde recalcularTrasEvento.
+      window.EventBus.dispatch('poolState:updated', {
+        poolId,
+        state: nuevoState,
+        modo_operativo: modoOpEmit, // V16.4.5 BUG-010
+        source: 'engine:recalcularTrasEvento',
+        tipoEvento: tipo,
+        timestamp: now
+      });
+
+      // V16.4.5 BUG-010: payload 4 — engine:recalculo_completado.
+      window.EventBus.dispatch('engine:recalculo_completado', {
+        poolId,
+        tipoEvento:               tipo,
+        confianza,
+        cloro_libre:              p.cloro_libre,
+        ph:                       p.ph,
+        isv:                      _leerValorISV(isv),
+        isv_estado:               isv.estado || 'Desconocido',
+        volumen_actual_m3:        volActual,
+        multiplicadores_externos: nuevoState._multiplicadores_externos || null,
+        factores_reportados:      nuevoState._factores_reportados      || null,
+        factor_sombra_uv:         nuevoState._factor_sombra_uv         || null,
+        modo_operativo:           modoOpEmit, // V16.4.5 BUG-010
+        timestamp: now
+      });
+
+      return nuevoState;
+    },
+
+    async proyectarTodas() {
+      const albercas = window.DB.getAlbercas();
+      if (!albercas || albercas.length === 0) return [];
+
+      const resultados = [];
+      for (const alberca of albercas) {
+        try {
+          const state = await Engine.proyectarEstadoActual(alberca.id);
+          if (state) resultados.push(state);
+        } catch (err) {
+          console.error(`[Engine.proyectarTodas] Error proyectando ${alberca.id}:`, err);
+        }
+      }
+
+      window.EventBus.dispatch('engine:proyeccion_lote_completada', {
+        total:       albercas.length,
+        proyectadas: resultados.length,
+        timestamp:   new Date().toISOString()
+      });
+
+      return resultados;
+    },
+
+    calcularConfianza(horasDesdeAncla) {
+      return _calcularConfianza(horasDesdeAncla);
+    },
+
+    // V16.4.0 ADD: exponer derivador de modo_operativo en API pública.
+    // V16.4.2: la función privada ahora tiene guardas defensivas completas.
+    calcularModoOperativo(tipoServicio, naturalezaColor, claridadActual, tipoAlga, ispb) {
+      return _calcularModoOperativo(tipoServicio, naturalezaColor, claridadActual, tipoAlga, ispb);
+    },
+
+    diagnostico() {
+      const albercas = window.DB ? window.DB.getAlbercas() : [];
+      return {
+        version: ENGINE_VERSION,
+        timestamp: new Date().toISOString(),
+        dependencias: {
+          EventBus:  !!window.EventBus,
+          DB:        !!window.DB,
+          Chemistry: !!window.Chemistry,
+          Clima:     !!window.Clima,
+          Solar:     !!window.Solar
+        },
+        constantes: { UMBRAL_REPROYECCION_HORAS, MAX_HORAS_SIN_ANCLA, CONFIANZA_DECAY_K },
+        albercas_registradas:    albercas.length,
+        tipos_evento_soportados: Object.values(TIPOS_EVENTO),
+        firma: 'Omar Alberto Valle Mercado | VAMO870509HW3'
+      };
+    }
+  });
+
+  window.Engine = Engine;
+
+  console.log(`[Engine] Pool Balance V${ENGINE_VERSION} — Motor de simulación cargado. Solar: ${!!window.Solar}`);
+
+})();
