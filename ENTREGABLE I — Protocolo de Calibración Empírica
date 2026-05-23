@@ -1,0 +1,145 @@
+ENTREGABLE I — Protocolo de Calibración Empírica
+Guía operativa para refinamiento de constantes con datos de campo Pool Balance · Veracruz, México · Mayo 2026 Para uso de Omar con su PWA y libro maestro en Google Sheets
+
+I.1. Por qué calibrar
+Las constantes que actualmente trae chemistry.js v16.7 (η_NaOH = 0.05, η_CaOH2 = 0.03, purezas comerciales nominales) provienen de hojas de seguridad y literatura general. La realidad de los lotes que usted compra en Veracruz puede diferir por varias razones legítimas: humedad del producto en bodega tropical, fabricantes locales con purezas reales distintas a las declaradas, degradación durante el transporte o almacenamiento, formulaciones específicas del proveedor. Calibrar significa reemplazar los valores de literatura por los valores reales de tu cadena de suministro, sin tocar las fórmulas termodinámicas.
+
+El protocolo es simple: predicción del registrador versus observación durante varias semanas, calcular un factor de corrección estadísticamente significativo y actualizar las constantes.
+
+I.2. Datos a registrador en cada dosificación
+Tras cada intervención, tu bitácora ya captura la predicción. Necesitas tres campos adicionales que Omar llena manualmente tras la siguiente lectura del ColorQ:
+
+DELTA_PH_REAL_OBSERVADO — la diferencia entre el pH actual (medido en la próxima visita) y el pH antes de la dosificación. Por ejemplo, si dosificaste con pH 7,4 y al volver mediste 7,30, este campo vale −0,10.
+
+HORAS_HASTA_OBSERVACION — cuantas horas pasaron entre la dosificación y la nueva lectura. Idealmente entre 12 y 48 horas: suficiente para que se complete la mezcla y la reespeciación cloro-cianurato, pero no tanto que la desgasificación de CO₂ domine sobre el impulso ácido-base inmediato.
+
+OBSERVACIONES_CALIBRACION — texto libre breve. Cualquier dato relevante: lluvia, aireación intensa, sospecha de aporte externo (ej. niños orinando), error sospechado en lectura inicial. Esto sirve para descartar valores atípicos durante el análisis.
+
+I.3. Fórmula del error de predicción
+Para cada dosificación calibrable (es decir, donde HORAS_HASTA_OBSERVACION esté entre 12 y 48 y no haya observaciones anómalas), calcule:
+
+Copyerror_absoluto = DELTA_PH_REAL_OBSERVADO − DELTA_PH_BASE
+
+error_relativo = error_absoluto / DELTA_PH_BASE     (solo si |DELTA_PH_BASE| > 0.05)
+
+dentro_de_banda = 1 si DELTA_PH_PESIMISTA ≤ DELTA_PH_REAL_OBSERVADO ≤ DELTA_PH_OPTIMISTA
+                 0 en caso contrario
+El error absoluto es la diferencia simple en unidades de pH. El error relativo se usa solo cuando la predicción es lo suficientemente grande para que la división tenga sentido (predicciones cercanas a cero amplifican ruido). La variable dentro_de_banda mide si la banda de incertidumbre de la Opción C está capturando correctamente la realidad.
+
+I.4. Métricas agregadas (revisar semanalmente)
+Acumula al menos 15 dosificaciones por producto antes de extraer conclusiones estadísticas. Con menos casos, el ruido domina sobre la señal.
+
+Sesgo (bias): la mediana de error_absoluto entre todas las dosificaciones de un mismo producto. Si la mediana es 0, el modelo predice correctamente en promedio. Si la mediana es +0.05, el modelo está subestimando sistemáticamente la acidificación (o sobreestimando la alcalinización); si es −0,05, lo contrario.
+
+Dispersión: la desviación estándar de error_absoluto. Idealmente menor a 0.05 para productos predecibles (Alkalin, CaCl₂, Bisulfato, Muriático) y menor a 0.10 para clorados (Tricloro, hipo calcio, NaOCl) donde hay más variabilidad de lote.
+
+Cobertura de banda: porcentaje de casos con dentro_de_banda = 1. Debe ser ≥ 75%. Si cae bajo 60%, las constantes pesimista/optimista son demasiado estrechas y deben ampliarse en CONST.
+
+I.5. Ajuste de η para Cloro Líquido (NaOCl)
+El parámetro η_NaOH representa moles de NaOH libres por mol de NaOCl en el producto comercial. Su efecto sobre ν es lineal:
+
+Copyν_NaOCl(pH, T) = −f_HOCl(pH, T) − η_NaOH
+Si el sesgo del cloro líquido es positivo (el modelo predice ΔpH más negativo que la realidad), significa que el η_NaOH default está sobrestimando la alcalinidad real del producto. Ajustar:
+
+Copyη_NaOH_calibrado = CONST.ETA_NAOH_DEFAULT − sesgo_NaOCl
+Si el sesgo es negativo (el modelo predice menos básico de lo real), incremente η_NaOH:
+
+Copyη_NaOH_calibrado = CONST.ETA_NAOH_DEFAULT + |sesgo_NaOCl|
+Restricciones: η_NaOH debe quedar entre 0 (producto puro sin NaOH libre) y 0.15 (caso extremo de mucha sosa libre, raro). Si el cálculo te lleva fuera de este rango, hay otro factor en juego (probablemente lote degradado o medición inconsistente); no apliques el ajuste.
+
+Ejemplo numérico: acumulaste 20 dosificaciones de cloro líquido en 6 semanas. Calcula mediana de error_absoluto = +0,03. Esto significa que el modelo predijo un pH 0.03 unidades más bajo del que realmente quedó. El producto es menos alcalino de lo asumido. Aplicar:
+
+Copyη_NaOH_calibrado = 0.05 − 0.03 = 0.02
+Actualizar en chemistry.js v16.7:
+
+CopyCONST.ETA_NAOH_DEFAULT = 0.02;   // calibrado Veracruz, mayo 2026, n=20
+I.6. Ajuste de η para Hipoclorito de Calcio Klaren
+Análogo al caso NaOCl pero para Ca(OH)₂ residual:
+
+Copyν_Ca(OCl)₂(pH, T) = −2·f_HOCl(pH, T) − 2·η_CaOH2
+El factor 2 hace que η_CaOH2 tenga el doble de palanca sobre ν que η_NaOH sobre el otro producto. La calibración:
+
+CopySi sesgo_hipo > 0  →  η_CaOH2_calibrado = CONST.ETA_CAOH2_DEFAULT − sesgo_hipo / 2
+Si sesgo_hipo < 0  →  η_CaOH2_calibrado = CONST.ETA_CAOH2_DEFAULT + |sesgo_hipo| / 2
+Restricciones: η_CaOH2 entre 0 y 0,08. Si sale fuera, sospechar de otra variable (típicamente: el producto es dibásico cristalino, con composición real Ca(OCl)₂·2Ca(OH)₂; en ese caso el η nominal sería 2.0 y se requiere modelo distinto).
+
+I.7. Ajuste de pureza comercial
+Para productos sin η (Tricloro, Bisulfato, Muriático, Alcalos, Alkalin, CaCl₂, CYA), el ajuste va sobre la pureza comercial efectiva:
+
+Copypureza_calibrada = pureza_actual × (DELTA_PH_BASE_promedio / DELTA_PH_REAL_OBSERVADO_promedio)
+Esto funciona porque la pureza entra linealmente en C_P (concentración molar dosificada) y por tanto linealmente en ΔpH:
+
+CopyC_P = (gramos × pureza × pureza_inerte) / (M × V_L)
+ΔpH ∝ C_P  →  ΔpH ∝ pureza
+Ejemplo: acumulaste 18 dosificaciones de Tricloro con DELTA_PH_BASE_promedio = −0.10 y DELTA_PH_REAL_OBSERVADO_promedio = −0.08. El modelo está prediciendo un 25% más de impacto del real. Ajustar:
+
+Copypureza_calibrada = 0.915 × (−0.08 / −0.10) = 0.915 × 0.80 = 0.732
+Esto sugiere que tu lote real tiene 73% de pureza efectiva, no 91.5% nominal. Esto es plausible si hay humedad alta en bodega o si el proveedor entrega calidad inferior a la declarada. Actualizar:
+
+CopyCONST.PUREZA_TRICLORO = 0.73;   // calibrado lote Veracruz mayo 2026, n=18
+Cuidado: una variación de pureza > 15% respecto al nominal es señal de problema con el lote, no de error del modelo. Verifique básicamente el producto (color, olor, humedad) antes de aplicar el ajuste.
+
+I.8. Cadencia de revisión y versionado de constantes
+Revisión mensual rápida: revise sesgo de cada producto con los últimos 10-15 casos. Si algún sesgo supera 0,10 en magnitud, marcarlo para investigación.
+
+Recalibración trimestral: aplicar las fórmulas de I.5 a I.7 a todos los productos con n ≥ 15 casos limpios. Actualizar constantes en chemistry.js v16.7. Bumpear versión a v16.7.1, v16.7.2, etc. (parche de lanzamiento). Registre el evento de recalibración en el registro de cambios del CÓDYCE.
+
+Recalibración mayor anual: revise el modelo completo, no solo constantes. Si las desviaciones persisten incluso tras calibrar η y purezas, puede haber un problema estructural (ej. el modelo no captura algún fenómeno como precipitación de CaCO₃ in situ, formación de cloraminas con orgánicos, demanda química de oxidación inesperada). Esto justifica una revisión científica con nueva auditoría.
+
+Hoja de versionado: mantén en Google Sheets una hoja "Constantes Calibradas v16.7" con columnas: constante, valor_nominal, valor_calibrado_actual, fecha_calibracion, n_casos_usados, sesgo_residual, observaciones. Esto te permite ver la evolución y revertir si una calibración degrada el rendimiento.
+
+I.9. Cuándo NO calibrar
+No aplique el protocolo en estas situaciones:
+
+Primero, menos de 15 casos limpios por producto. La estadística es ruido.
+
+Segundo, los valores atípicos son obvios sin explicar. Si tienes una dosificación con error_absoluto > 0.30 sin causa identificada, excluye el caso y registra "verificar la próxima vez" en observaciones. No hay ajustes constantes para acomodar mediciones sospechosas.
+
+Tercero, inconsistencia entre productos. Si calibrar el Tricloro a pureza 0.73 ayuda a sus predicciones pero rompe la consistencia con el aporte de CYA (que sigue calibrado a 60% por unidad Cl), tienes un conflicto. Investigue antes de aplicar.
+
+Cuarto, lote nuevo o cambio de proveedor. Espere al menos 5 dosificaciones del lote nuevo antes de incluirlo en estadísticas. Marca cambios de proveedor en bitácora para poder separar las muestras.
+
+Quinto, estación climática extrema. Si tus datos vienen mayoritariamente de la temporada de Nortes (noviembre-marzo) y vas a aplicar la calibración en temporada de calor, mejor recalibrar al cambio de estación. Las propiedades del agua (CO₂ disuelto, evaporación, demanda biológica) cambian.
+
+I.10. Flujo operativo resumido
+Copy1. Cada dosificación:
+   → Isaías genera bitácora con DELTA_PH_BASE predicho.
+   → Omar exporta a Sheets.
+
+2. Próxima visita (12-48 h):
+   → Lee ColorQ.
+   → Calcula DELTA_PH_REAL = pH_actual − pH_previo.
+   → Llena las 3 columnas de calibración en Sheets.
+
+3. Mensualmente:
+   → Revisa sesgo agregado por producto.
+   → Identifica candidatos a recalibración.
+
+4. Trimestralmente:
+   → Aplica fórmulas I.5–I.7 con n ≥ 15 casos.
+   → Actualiza CONST en chemistry.js.
+   → Versiona y documenta.
+
+5. Anualmente:
+   → Revisión estructural del modelo.
+   → Auditoría científica si hay desviaciones persistentes.
+I.11. Plantilla de fórmula para Google Sheets
+Para automatizar el cálculo en tu libro maestro, las columnas calibradas pueden tener estas fórmulas (asumiendo que DELTA_PH_BASE está en columna T, DELTA_PH_PESIMISTA en U, DELTA_PH_OPTIMISTA en V, DELTA_PH_REAL_OBSERVADO en W):
+
+CopyERROR_ABSOLUTO         = W2 - T2
+ERROR_RELATIVO         = IF(ABS(T2)>0.05, (W2-T2)/T2, "n/a")
+DENTRO_DE_BANDA        = IF(AND(W2>=U2, W2<=V2), 1, 0)
+ES_CALIBRABLE          = IF(AND(X2>=12, X2<=48, Y2=""), 1, 0)
+                          (X = HORAS_HASTA_OBSERVACION, Y = OBSERVACIONES_CALIBRACION)
+Y en una hoja resumen por producto:
+
+CopySESGO_TRICLORO         = MEDIAN(FILTER(ERROR_ABSOLUTO, PRODUCTO="tricloro", ES_CALIBRABLE=1))
+DISPERSION_TRICLORO    = STDEV(FILTER(ERROR_ABSOLUTO, PRODUCTO="tricloro", ES_CALIBRABLE=1))
+COBERTURA_TRICLORO     = AVERAGE(FILTER(DENTRO_DE_BANDA, PRODUCTO="tricloro", ES_CALIBRABLE=1))
+N_TRICLORO             = COUNTIFS(PRODUCTO, "tricloro", ES_CALIBRABLE, 1)
+PUREZA_SUGERIDA        = IF(N_TRICLORO>=15, 0.915 * (MEDIAN_BASE / MEDIAN_REAL), "esperar más datos")
+Con eso tienes monitoreo continuo y, cuando N ≥ 15 para un producto, Sheets te dice directamente cuál sería la pureza calibrada sugerida. Tú decides si la aplicación.
+
+— FIN DEL ENTREGABLE I —
+
+"
