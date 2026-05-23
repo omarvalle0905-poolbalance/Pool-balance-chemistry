@@ -1,0 +1,2078 @@
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * POOL BALANCE — Motor Químico V16.7.0 (Gemelo Digital Ciber-Físico)
+ * Factor Omar · Índice de Saturación Pool Balance (ISPB)
+ * Marcas Reales: Klaren, Spin, Cristalin, Novem
+ *
+ * © Omar Alberto Valle Mercado | RFC: VAMO870509HW3
+ * Pool Balance - Gestoría Hídrica Profesional
+ *
+ * VERSIÓN: 16.7.0 — Wojtowicz dinámica + Proyector Temporal del ISPB
+ *   Fecha: 2026-05-24
+ *
+ *   PASO 1 — Refactor calcISV con Wojtowicz dinámica:
+ *   - V16.7.0 ADD CONST WOJTOWICZ_TABLA (8 pares pH-factor, Wojtowicz 1995/2004).
+ *   - V16.7.0 ADD METHOD _factorWojtowicz(ph): interpolación lineal entre puntos,
+ *     clamp en extremos. Reemplaza heurística CYA/3 en calcISV.
+ *   - V16.7.0 MOD calcISV: alkCorr = max(1, alkN - (cianN * factorWoj)).
+ *     Elimina sesgo de hasta ±0.04 pHs en extremos del rango operativo.
+ *     Retorna wojtowicz_factor y wojtowicz_metodo para trazabilidad.
+ *   - Compatibilidad: cero regresión. Firma pública intacta.
+ *
+ *   ENTREGABLE G — Proyector Temporal del ISPB (Sección 14 del Códyce NEXUS V17.8):
+ *   - V16.7.0 ADD CONST: bloque PROYECTOR_*, DESGASIFICACION_VEL_BASE,
+ *     PH_EQUILIBRIO_TECHO, PH_INICIO_DECAIMIENTO, EVAPORACION_MM_DIA_DEFAULT,
+ *     ZONAS_RECUBRIMIENTO (deuda D2 declarada), PROYECTOR_COEF_DOSIS.
+ *   - V16.7.0 ADD METHODS privados:
+ *       _techoSuavizadoDesgasificacion(pH)
+ *       _evaporacionFactorHora(prof_m, evap_mm_dia)
+ *       _zonaSeguridadRecubrimiento(recubrimiento)
+ *       _recalcularPHsProyector(estado, F_T)
+ *       _aplicarEventoProyector(estado, evento, vol_m3)
+ *       _proyectorRecomendacion(alerta_salida, zona, horizonte_h, regimen)
+ *   - V16.7.0 ADD METHOD público: proyectarISPB(estadoInicial, horizonte_h,
+ *     eventos, opciones). Integración Euler paso 1h, horizonte máx 168h,
+ *     detección de cruce con confirmación 3 puntos. Integra dinámicamente
+ *     calcDeltaPhPorDosificacion (Sección 13) si está presente; fallback
+ *     a coeficientes lineales (deuda D1).
+ *   - V16.7.0 ADD: TESTS_PROYECTOR_V17_8 (6 casos T_PROJ_01..06) y
+ *     ejecutarTestsProyector(). Criterio de promoción: 6/6 verde.
+ *
+ *   DEUDAS TÉCNICAS DECLARADAS:
+ *   - D1: aproximaciones lineales en _aplicarEventoProyector se reemplazarán
+ *         por calcDeltaPhPorDosificacion cuando supere validación retrospectiva
+ *         en ≥5 clientes con error medio absoluto ≤0.10 ISPB.
+ *   - D2: ZONAS_RECUBRIMIENTO duplicada en CONST y calcISV. Refactorizar
+ *         calcISV para que consuma this.CONST.ZONAS_RECUBRIMIENTO.
+ *   - D3: temperatura constante durante el horizonte. v2 soportará T(t).
+ *   - D4: velocidad de desgasificación nominal (±50%). Calibración kLa
+ *         por cliente diferido a v2 con bitácora histórica.
+ *
+ * VERSIÓN: 16.6.0 — Helpers calcFraccionHOCl y calcHOClActivo (adición)
+ *   - V16.6.0 ADD METHOD calcFraccionHOCl(ph, temp): fracción HOCl activo.
+ *   - V16.6.0 ADD METHOD calcHOClActivo(cl, ph, temp): ppm HOCl activo.
+ *
+ * VERSIÓN: 16.5.4 — Hotfix umbrales FC/CYA dinámicos
+ *   - V16.5.4 FIX getUmbralesClorOperativos: cl_minimo, cl_toxico y
+ *     cl_superchoque dividen entre 100.
+ *
+ * VERSIÓN: 16.5.3 — Modo operativo consciente (cirugía 1 de 4)
+ *   - getUmbralesClorOperativos acepta modo. FACTORES_CLORO_POR_MODO.
+ *   - evaluarAgua (getAlertas) propaga modo. Silencia cloro en metales.
+ *   - calcSaludGeneral (calcHealth) aplica topes TOPES_SALUD_POR_MODO.
+ *
+ * VERSIÓN: 16.5.2 — N-07: Alkalin reporta colateral sobre pH.
+ *
+ * VERSIÓN: 16.5.1 — Albedo y rugosidad cableados al motor químico.
+ *
+ * VERSIÓN: 16.5.0 — Regla FC/CYA dinámica (TFP/CMAHC) integrada.
+ *
+ * VERSIÓN: 16.4.6 — Calibración Klaren comercial (~50% NaHSO4).
+ *   - NAHSO4_G_POR_PPM_ALK_10M3: 50.94 (calibrado empíricamente).
+ *
+ * VERSIÓN: 16.4.5 — Pulido auditoría (typos, literales mágicos).
+ * VERSIÓN: 16.4.4 — Modo dual Ácido Muriático (pH vs Alcalinidad).
+ * VERSIÓN: 16.4.3 — Corrección de deltaPH en calcDeltaPorAplicacion.
+ * VERSIÓN: 16.4.2 — ADD: calcDeltaPorAplicacion.
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
+
+'use strict';
+
+const Chemistry = {
+
+  VERSION: '16.7.0',
+
+  CONST: {
+    TRICLORO_CLORO_PCT:        0.90,
+    TRICLORO_CIAN_PCT:         0.55,
+    HIPO_CALCIO_CLORO_PCT:     0.65,
+    HIPO_CALCIO_DUREZA_PPM_G:  0.8,
+    CLORO_LIQUIDO_PCT:         0.10,
+    ALCALOS_G_POR_PUNTO_PH_10M3: 11,
+
+    // CPO (Skinner & Hales): 16.78 g NaHCO3 por +1 ppm ALK en 10 m³
+    ALKALIN_G_POR_10PPM_10M3:  168,
+
+    ACIDO_L_POR_PUNTO_PH_10M3: 1.0,
+    CYA_G_POR_PPM_M3:          1.0,
+    CALCIO_G_POR_10PPM_10M3:   100,
+    GOLDCLEAR_ML_MANT_POR_M3:  15,
+    GOLDCLEAR_ML_CHOQUE_POR_M3: 30,
+    MAGNESIO_G_POR_PUNTO_PH_10M3: 8,
+    ALGEN_ML_MANT_POR_M3:      10,
+    ALGEN_ML_CHOQUE_POR_M3:    20,
+
+    // pH Menos Klaren — Bisulfato de Sodio (NaHSO4) / Ácido Globular
+    // Calibrado contra tabla fabricante Klaren (Brunssen Internacional)
+    // Base: 55 g por -0.1 pH por 10 m³ (a ALK ~100 ppm, pH ~7.8)
+    PH_MENOS_G_BASE_POR_01PH_10M3: 55,
+
+    // V16.4.6 FIX KLAREN-50: Impacto de pH Menos Klaren en Alcalinidad
+    // Calibración empírica: 220 g en 10 m³, ALK=83 → Δ ALK = -4.1 ppm
+    // Constante derivada: 220 / 4.1 ≈ 50.94 g/ppm/10m³.
+    NAHSO4_G_POR_PPM_ALK_10M3: 50.94, // V16.4.6 FIX KLAREN-50
+
+    // NaHCO3 puro — CPO Skinner & Hales
+    NAHCO3_G_POR_PPM_ALK_10M3: 16.78,
+
+    // Ácido Muriático impacto ALK — CPO Skinner & Hales
+    HCL_PPM_ALK_POR_LITRO_10M3: 50,
+
+    // V16.4.1 FIX A4: Cloro Líquido aporte de ALK
+    NAOCL_DELTA_ALK_POR_PPM_CL: 1.4,
+
+    CYA_BLOQUEO:               75,
+    CYA_CRITICO:               100,
+    PH_MIN_CRITICO:            7.0,
+    PH_MAX_CRITICO:            8.0,
+    PH_OPTIMO_MIN:             7.2,
+    PH_OPTIMO_MAX:             7.6,
+
+    // V16.5.0: Fallback cuando CYA = 0
+    CL_MIN_SANITARIO:          0.5,
+    CL_OPTIMO_MIN:             1.0,
+
+    ALK_OPTIMO_MIN:            80,
+    ALK_OPTIMO_MAX:            120,
+    CH_OPTIMO_MIN:             200,
+    CH_OPTIMO_MAX:             400,
+    TDS_OPTIMO_MAX:            1500,
+    TDS_CRITICO:               2000,
+    ISV_SEGURO_MIN:            -0.3,
+    ISV_SEGURO_MAX:             0.3,
+
+    // V16.4.1 FIX A6: Rangos físicamente plausibles
+    PH_FISICO_MIN:             4.0,
+    PH_FISICO_MAX:             11.0,
+
+    // ─────────────────────────────────────────────────────────
+    // V16.5.0 ADD: Regla FC/CYA dinámica (TFP / CMAHC)
+    // ─────────────────────────────────────────────────────────
+    FC_CYA_MIN_PCT:            7.5,
+    FC_CYA_OBJ_PCT:            10,
+    FC_CYA_ALTO_PCT:           30,
+    FC_CYA_TOXICO_PCT:         50,
+    FC_CYA_SUPERCHOQUE_PCT:    80,
+    FC_PISO_ABSOLUTO:          1.5,
+
+    // V16.5.3 ADD — Factores de cloro por modo operativo.
+    FACTORES_CLORO_POR_MODO: Object.freeze({
+      rutinario:           { cl_obj_pct: 0.10, cl_alto_pct: 0.30 },
+      rescate:             { cl_obj_pct: 0.40, cl_alto_pct: 0.50 },
+      post_choque:         { cl_obj_pct: 0.30, cl_alto_pct: 0.50 },
+      recuperacion_severa: { cl_obj_pct: 0.30, cl_alto_pct: 0.50 },
+      recuperacion_leve:   { cl_obj_pct: 0.20, cl_alto_pct: 0.40 },
+      sarro_controlado:    { cl_obj_pct: 0.10, cl_alto_pct: 0.30 },
+      balance:             { cl_obj_pct: 0.10, cl_alto_pct: 0.30 },
+      metales:             { cl_obj_pct: null, cl_alto_pct: null }
+    }),
+
+    // V16.5.3 ADD — Topes de salud general por modo operativo.
+    TOPES_SALUD_POR_MODO: Object.freeze({
+      rutinario:           100,
+      rescate:             40,
+      post_choque:         70,
+      recuperacion_severa: 50,
+      recuperacion_leve:   75,
+      sarro_controlado:    60,
+      balance:             100,
+      metales:             30
+    }),
+
+    // ─────────────────────────────────────────────────────────
+    // V16.7.0 ADD — Matriz Wojtowicz dinámica para corrección
+    // de alcalinidad por ácido cianúrico.
+    //
+    // Fuente primaria: Wojtowicz, J.A. (1995, 2004) "Effect of
+    // Cyanuric Acid on Swimming Pool Maintenance" J. Swimming
+    // Pool & Spa Industry. Tabla de factores publicados.
+    //
+    // Reemplaza la aproximación heurística ALK - CYA/3, que
+    // introduce errores de hasta ±0.04 unidades de pHs en los
+    // extremos de pH (7.0 y 8.2), magnificados en proyecciones
+    // temporales largas.
+    //
+    // Aplicación: ALK_corregida = max(1, ALK - CYA × factor(pH))
+    // Interpolación: lineal entre puntos adyacentes.
+    // ─────────────────────────────────────────────────────────
+    WOJTOWICZ_TABLA: Object.freeze([
+      { ph: 7.0, f: 0.27 },
+      { ph: 7.2, f: 0.28 },
+      { ph: 7.4, f: 0.32 },
+      { ph: 7.5, f: 0.33 },
+      { ph: 7.6, f: 0.34 },
+      { ph: 7.8, f: 0.35 },
+      { ph: 8.0, f: 0.36 },
+      { ph: 8.2, f: 0.37 }
+    ]),
+
+    // ━━━ INICIO P.1 — Constantes del Proyector Temporal v16.7.0 ━━━
+
+    // Velocidad base de desgasificación de CO₂ (Δ pH por hora)
+    // Sección 14.3.1 del Códyce · Calibración Pool Balance Veracruz
+    DESGASIFICACION_VEL_BASE: {
+      reposo:      0.003,
+      filtracion:  0.015,
+      cascada:     0.080,
+      spa_venturi: 0.150
+    },
+
+    // Techo asintótico de pH por desgasificación natural
+    PH_EQUILIBRIO_TECHO:      8.4,
+    PH_INICIO_DECAIMIENTO:    8.0,
+
+    // Evaporación promedio (mm/día) si no se especifica
+    EVAPORACION_MM_DIA_DEFAULT: 4.0,
+
+    // Parámetros del proyector
+    PROYECTOR_PASO_HORAS:               1,
+    PROYECTOR_HORIZONTE_MAX:            168,
+    PROYECTOR_PUNTOS_CRUCE_CONFIRMACION: 3,
+
+    // Modos donde el proyector NO debe ejecutarse (Sección 14.8.3)
+    PROYECTOR_MODOS_PROHIBIDOS: ['rescate', 'metales', 'recuperacion_severa'],
+
+    // Dilución por retrolavado por defecto (%)
+    PROYECTOR_RETROLAVADO_PCT_DEFAULT: 5,
+
+    // Aporte de ALK por lluvia (ppm). Lluvia urbana limpia ~0.
+    PROYECTOR_LLUVIA_ALK_PPM: 0,
+
+    // ─────────────────────────────────────────────────────────
+    // ZONAS_RECUBRIMIENTO — Replicado del hardcode en calcISV
+    // Deuda D2: refactorizar calcISV para que consuma esta constante.
+    // ─────────────────────────────────────────────────────────
+    ZONAS_RECUBRIMIENTO: {
+      porcelanato: { min: -0.10, max: 0.30 },
+      veneciano:   { min: -0.10, max: 0.30 },
+      fibra:       { min: -0.30, max: 0.10 },
+      pebble:      { min: -0.20, max: 0.50 },
+      vinil:       { min: -0.30, max: 0.20 },
+      azulejo:     { min: -0.15, max: 0.35 },
+      concreto:    { min: -0.20, max: 0.40 },
+      piedra:      { min: -0.20, max: 0.50 }
+    },
+
+    // ─────────────────────────────────────────────────────────
+    // Coeficientes lineales de fallback (deuda D1).
+    // Solo se usan si calcDeltaPhPorDosificacion NO está disponible.
+    // Calibrados contra calcDeltaPorAplicacion v16.6.0.
+    // ─────────────────────────────────────────────────────────
+    PROYECTOR_COEF_DOSIS: {
+      dosis_tricloro:         { dpH: -0.020,    dFC:  0.90, dCYA:  0.55, dALK:  0.00 },
+      dosis_hipo_calcio:      { dpH:  0.0005,   dFC:  0.65, dCYA:  0.00, dALK:  0.00 },
+      dosis_cloro_liquido:    { dpH:  0.000003, dFC:  0.10, dCYA:  0.00, dALK:  0.0014 },
+      dosis_bisulfato_klaren: { dpH: -0.0018,   dFC:  0.00, dCYA:  0.00, dALK: -0.196 },
+      dosis_acido_muriatico:  { dpH: -0.0001,   dFC:  0.00, dCYA:  0.00, dALK: -0.05  },
+      dosis_alkalin:          { dpH:  0.00018,  dFC:  0.00, dCYA:  0.00, dALK:  0.595 }
+    },
+
+    // ━━━ FIN P.1 ━━━
+
+    FIRMA: 'Omar Alberto Valle Mercado | VAMO870509HW3'
+  },
+
+  // ═══════════════════════════════════════════════
+  //  FACTOR TEMPERATURA — Tabla Langelier Pool-Industry
+  //  Compatible con fórmula: LSI = pH + TF + CF + AF - 12.1
+  // ═══════════════════════════════════════════════
+
+  _factorTemp(tempC) {
+    const tabla = [
+      { t:  0, f: 0.058 },
+      { t:  5, f: 0.134 },
+      { t: 10, f: 0.165 },
+      { t: 15, f: 0.208 },
+      { t: 20, f: 0.247 },
+      { t: 25, f: 0.290 },
+      { t: 27, f: 0.310 },
+      { t: 28, f: 0.320 },
+      { t: 29, f: 0.330 },
+      { t: 30, f: 0.340 },
+      { t: 32, f: 0.360 },
+      { t: 35, f: 0.390 },
+      { t: 37, f: 0.410 },
+      { t: 40, f: 0.440 },
+      { t: 45, f: 0.490 },
+      { t: 50, f: 0.530 }
+    ];
+
+    const temp = parseFloat(tempC) || 0;
+
+    if (temp <= tabla[0].t) return tabla[0].f;
+    if (temp >= tabla[tabla.length - 1].t) return tabla[tabla.length - 1].f;
+
+    for (let i = 0; i < tabla.length - 1; i++) {
+      const puntoActual    = tabla[i];
+      const puntoSiguiente = tabla[i + 1];
+      if (temp >= puntoActual.t && temp <= puntoSiguiente.t) {
+        const deltaT  = temp - puntoActual.t;
+        const rangoT  = puntoSiguiente.t - puntoActual.t;
+        const rangoF  = puntoSiguiente.f - puntoActual.f;
+        const resultado = puntoActual.f + (deltaT * rangoF / rangoT);
+        return parseFloat(resultado.toFixed(4));
+      }
+    }
+
+    return 0.290;
+  },
+
+  // ═══════════════════════════════════════════════
+  //  V16.7.0 ADD — FACTOR WOJTOWICZ DINÁMICO
+  //
+  //  Devuelve el factor de corrección de cianurato sobre
+  //  alcalinidad total según el pH actual del agua. Reemplaza
+  //  la regla heurística CYA/3 por la matriz publicada por
+  //  Wojtowicz (1995, 2004).
+  //
+  //  Para pH fuera del rango tabulado [7.0, 8.2]: clamp al
+  //  valor del borde más cercano (NO extrapolar).
+  //  Interpolación entre puntos: lineal (consistente con _factorTemp).
+  // ═══════════════════════════════════════════════
+
+  _factorWojtowicz(ph) {
+    const tabla = this.CONST.WOJTOWICZ_TABLA;
+    const phN   = parseFloat(ph);
+
+    if (isNaN(phN)) return tabla[3].f; // fallback pH 7.5 = 0.33
+
+    // Clamp en extremos (no extrapolar fuera de rango validado)
+    if (phN <= tabla[0].ph) return tabla[0].f;
+    if (phN >= tabla[tabla.length - 1].ph) return tabla[tabla.length - 1].f;
+
+    // Interpolación lineal entre puntos adyacentes
+    for (let i = 0; i < tabla.length - 1; i++) {
+      const p0 = tabla[i];
+      const p1 = tabla[i + 1];
+      if (phN >= p0.ph && phN <= p1.ph) {
+        const deltaPh = phN - p0.ph;
+        const rangoPh = p1.ph - p0.ph;
+        const rangoF  = p1.f  - p0.f;
+        const resultado = p0.f + (deltaPh * rangoF / rangoPh);
+        return parseFloat(resultado.toFixed(4));
+      }
+    }
+
+    return tabla[3].f; // unreachable, fallback defensivo
+  },
+
+  // ━━━ INICIO P.2 — Helpers físicos del proyector v16.7.0 ━━━
+
+  /**
+   * Techo suavizado de desgasificación entre pH 8.0 y 8.4.
+   * Factor 1.0 si pH <= 8.0; baja linealmente a 0.0 en pH >= 8.4.
+   * Sección 14.3.1(a) del Códyce.
+   */
+  _techoSuavizadoDesgasificacion(pH) {
+    const inicio = this.CONST.PH_INICIO_DECAIMIENTO; // 8.0
+    const techo  = this.CONST.PH_EQUILIBRIO_TECHO;   // 8.4
+    if (pH <= inicio) return 1.0;
+    if (pH >= techo)  return 0.0;
+    return (techo - pH) / (techo - inicio);
+  },
+
+  /**
+   * Factor de concentración por evaporación, por hora.
+   * Sección 14.3.4(a) del Códyce.
+   */
+  _evaporacionFactorHora(prof_m, evap_mm_dia) {
+    const prof = (prof_m > 0) ? prof_m : 1.5;
+    const evap = (evap_mm_dia >= 0) ? evap_mm_dia : this.CONST.EVAPORACION_MM_DIA_DEFAULT;
+    const fraccionHora = (evap / 24) / (prof * 1000);
+    return 1 / (1 - fraccionHora);
+  },
+
+  /**
+   * Devuelve la zona de seguridad ISPB del recubrimiento.
+   * Lee de Chemistry.CONST.ZONAS_RECUBRIMIENTO.
+   * Sección 14.3.6 del Códyce.
+   */
+  _zonaSeguridadRecubrimiento(recubrimiento) {
+    const tabla = this.CONST.ZONAS_RECUBRIMIENTO;
+    const key   = (typeof recubrimiento === 'string') ? recubrimiento : 'porcelanato';
+    const z     = tabla[key] || tabla.porcelanato;
+    return { min: z.min, max: z.max, recubrimiento: tabla[key] ? key : 'porcelanato' };
+  },
+
+  /**
+   * Recalcula pHs (Langelier) e ISPB del estado actual usando
+   * la misma fórmula que calcISV. Incluye corrección Wojtowicz
+   * dinámica. Muta el estado in-place.
+   * Sección 14.3.6 del Códyce.
+   */
+  _recalcularPHsProyector(estado, F_T) {
+    const phN  = estado.pH;
+    const alkN = Math.max(1, estado.ALK);
+    const chN  = Math.max(1, estado.CH);
+    const cyaN = Math.max(0, estado.CYA);
+    const tdsN = Math.max(0, estado.TDS || 0);
+
+    // Corrección Wojtowicz dinámica (v16.7.0 PASO 1)
+    let factorWoj, alkCorr;
+    if (typeof this._factorWojtowicz === 'function') {
+      factorWoj = this._factorWojtowicz(phN);
+      alkCorr   = Math.max(1, alkN - (cyaN * factorWoj));
+    } else {
+      factorWoj = 1 / 3;
+      alkCorr   = Math.max(1, alkN - (cyaN / 3));
+    }
+
+    const F_CH  = Math.log10(chN);
+    const F_ALK = Math.log10(alkCorr);
+    let   F_TDS = 0;
+    if (tdsN > 1000) F_TDS = 0.1 * Math.log10(tdsN / 1000);
+
+    const LANGELIER_CONST = 12.1;
+    const pHs  = LANGELIER_CONST + F_TDS - F_T - F_CH - F_ALK;
+    const ispb = phN - pHs;
+
+    estado.pHs              = parseFloat(pHs.toFixed(3));
+    estado.ispb             = parseFloat(ispb.toFixed(3));
+    estado.alkCorr          = parseFloat(alkCorr.toFixed(2));
+    estado.wojtowicz_factor = parseFloat(factorWoj.toFixed(4));
+  },
+
+  // ━━━ FIN P.2 ━━━
+
+  // ━━━ INICIO P.3 — Despachador de eventos del proyector v16.7.0 ━━━
+
+  /**
+   * Aplica un evento programado al estado del agua.
+   * Sección 14.5 del Códyce.
+   *
+   * Tipos de evento: dosis_tricloro, dosis_hipo_calcio,
+   * dosis_acido_muriatico, dosis_bisulfato_klaren, dosis_alkalin,
+   * dosis_cloro_liquido, lluvia, retrolavado.
+   * Payload de dosis: cantidad_g (gramos) o cantidad_ml (mililitros).
+   * Payload de lluvia/retrolavado: volumen_pct (% del volumen del vaso).
+   */
+  _aplicarEventoProyector(estado, evento, volumen_m3) {
+    if (!evento || !evento.tipo) return;
+    const V    = (volumen_m3 > 0) ? volumen_m3 : 1;
+    const tipo = String(evento.tipo).toLowerCase();
+    const tieneF = (typeof this.calcDeltaPhPorDosificacion === 'function');
+
+    // Mapeo de tipos doctrinales a producto del Entregable F
+    const mapaProductoF = {
+      dosis_tricloro:         'tricloro',
+      dosis_hipo_calcio:      'hipo_calcio',
+      dosis_cloro_liquido:    'cloro_liquido',
+      dosis_bisulfato_klaren: 'bisulfato',
+      dosis_acido_muriatico:  'muriatico',
+      dosis_alkalin:          'alkalin'
+    };
+
+    // ───── DOSIS DE PRODUCTO ─────
+    if (mapaProductoF[tipo]) {
+      let gramos = parseFloat(evento.cantidad_g || 0);
+      if (gramos <= 0 && evento.cantidad_ml) {
+        const densidad = (tipo === 'dosis_acido_muriatico') ? 1.16 : 1.0;
+        gramos = parseFloat(evento.cantidad_ml) * densidad;
+      }
+      if (gramos <= 0) return;
+
+      if (tieneF) {
+        // Camino preciso (Entregable F / Sección 13)
+        try {
+          const productoF = mapaProductoF[tipo];
+          const lecturas  = {
+            pH:     estado.pH,
+            ALK:    estado.ALK,
+            CYA:    estado.CYA,
+            FC:     estado.FC || 0,
+            T_agua: estado.temperatura
+          };
+          const r = this.calcDeltaPhPorDosificacion(productoF, gramos, V, lecturas, {});
+          if (r && typeof r.phFinalBase === 'number') {
+            estado.pH  = r.phFinalBase;
+            estado.ALK = r.alkTotalFinal;
+            estado.CYA = r.cyaFinal;
+            estado.CH  = (estado.CH || 0) + (r.deltaCH || 0);
+            const coefFC = this.CONST.PROYECTOR_COEF_DOSIS[tipo];
+            if (coefFC) estado.FC = (estado.FC || 0) + coefFC.dFC * (gramos / V);
+            return;
+          }
+        } catch (e) {
+          console.warn('[Proyector] calcDeltaPhPorDosificacion falló, fallback lineal:', e.message);
+        }
+      }
+
+      // Fallback lineal (deuda D1)
+      const coef = this.CONST.PROYECTOR_COEF_DOSIS[tipo];
+      if (!coef) return;
+      const dosis = gramos / V;
+      estado.pH  = estado.pH  + coef.dpH  * dosis;
+      estado.FC  = (estado.FC || 0) + coef.dFC  * dosis;
+      estado.CYA = estado.CYA + coef.dCYA * dosis;
+      estado.ALK = Math.max(0, estado.ALK + coef.dALK * dosis);
+      return;
+    }
+
+    // ───── LLUVIA ─────
+    if (tipo === 'lluvia') {
+      const fraccion = parseFloat(evento.volumen_pct || 0) / 100;
+      if (fraccion <= 0 || fraccion > 1) return;
+
+      const pH_lluvia  = 5.6;
+      const ALK_lluvia = this.CONST.PROYECTOR_LLUVIA_ALK_PPM;
+
+      const Hpool   = Math.pow(10, -estado.pH);
+      const Hlluvia = Math.pow(10, -pH_lluvia);
+      const Hmix    = (Hpool * (1 - fraccion)) + (Hlluvia * fraccion);
+      estado.pH     = -Math.log10(Hmix);
+
+      estado.ALK = estado.ALK * (1 - fraccion) + ALK_lluvia * fraccion;
+      estado.CH  = estado.CH  * (1 - fraccion);
+      estado.CYA = estado.CYA * (1 - fraccion);
+      estado.FC  = (estado.FC || 0) * (1 - fraccion);
+      estado.TDS = (estado.TDS || 0) * (1 - fraccion);
+      return;
+    }
+
+    // ───── RETROLAVADO ─────
+    if (tipo === 'retrolavado') {
+      const pct      = parseFloat(evento.volumen_pct || this.CONST.PROYECTOR_RETROLAVADO_PCT_DEFAULT);
+      const fraccion = Math.max(0, Math.min(15, pct)) / 100;
+      if (fraccion <= 0) return;
+
+      const pH_rep  = parseFloat(evento.pH_reposicion  || 7.5);
+      const ALK_rep = parseFloat(evento.ALK_reposicion || 80);
+      const CH_rep  = parseFloat(evento.CH_reposicion  || 150);
+
+      const Hpool = Math.pow(10, -estado.pH);
+      const Hrep  = Math.pow(10, -pH_rep);
+      const Hmix  = (Hpool * (1 - fraccion)) + (Hrep * fraccion);
+      estado.pH   = -Math.log10(Hmix);
+
+      estado.ALK = estado.ALK * (1 - fraccion) + ALK_rep * fraccion;
+      estado.CH  = estado.CH  * (1 - fraccion) + CH_rep  * fraccion;
+      estado.CYA = estado.CYA * (1 - fraccion);
+      estado.FC  = (estado.FC || 0) * (1 - fraccion);
+      estado.TDS = (estado.TDS || 0) * (1 - fraccion);
+      return;
+    }
+
+    // Eventos no reconocidos: silenciosamente ignorados (Sección 14.5)
+  },
+
+  // ━━━ FIN P.3 ━━━
+
+  // ━━━ INICIO P.4 — Recomendación operativa del proyector v16.7.0 ━━━
+
+  /**
+   * Genera la recomendación operativa en lenguaje técnico para Omar.
+   * Sección 14.8.1 del Códyce.
+   */
+  _proyectorRecomendacion(alerta_salida, zona, horizonte_h, regimen) {
+    if (!alerta_salida) {
+      return 'Agua estable dentro de la zona de seguridad ISPB (' +
+        zona.min.toFixed(2) + ' a ' + zona.max.toFixed(2) +
+        ') durante el horizonte de ' + horizonte_h + ' h. ' +
+        'Mantener régimen actual (' + regimen + ') y dosificación rutinaria.';
+    }
+
+    const h         = alerta_salida.hora;
+    const ispb      = alerta_salida.ISPB_en_cruce;
+    const direccion = alerta_salida.direccion;
+
+    if (direccion === 'incrustante') {
+      return 'ALERTA: el ISPB cruzará la zona segura por el lado INCRUSTANTE ' +
+        'en h+' + h + ' (ISPB ' + ispb.toFixed(2) + '). ' +
+        'Recomendación: aplicar pH Menos Klaren o ácido muriático preventivo ' +
+        (h <= 24 ? 'HOY mismo' : 'antes de h+' + Math.max(1, h - 12)) +
+        '. Si el régimen es cascada/spa, considerar reducir aireación.';
+    } else {
+      return 'ALERTA: el ISPB cruzará la zona segura por el lado CORROSIVO ' +
+        'en h+' + h + ' (ISPB ' + ispb.toFixed(2) + '). ' +
+        'Recomendación: subir alcalinidad con Alkalin Spin y/o dureza con ' +
+        'Cloruro de Calcio antes de h+' + Math.max(1, h - 12) + '.';
+    }
+  },
+
+  // ━━━ FIN P.4 ━━━
+
+  _colorISV(isv, zonaMin, zonaMax) {
+    const v = parseFloat(isv);
+    if (v < zonaMin - 0.5) return '#dc2626';
+    if (v < zonaMin)       return '#f59e0b';
+    if (v >= zonaMin && v <= zonaMax) return '#2da44e';
+    if (v <= zonaMax + 0.5) return '#3b82f6';
+    return '#7c3aed';
+  },
+
+  // ═══════════════════════════════════════════════
+  //  V16.5.4 FIX: getUmbralesClorOperativos
+  //  V16.5.3 MOD: recibe modo operativo
+  //  V16.5.0 ADD: implementación inicial
+  // ═══════════════════════════════════════════════
+
+  getUmbralesClorOperativos(cya, modo) {
+    const C = this.CONST;
+    const cyaN     = parseFloat(cya);
+    const cyaValido = !isNaN(cyaN) && cyaN >= 20;
+
+    const modoN = (typeof modo === 'string' && C.FACTORES_CLORO_POR_MODO[modo])
+      ? modo : 'rutinario';
+
+    const factores   = C.FACTORES_CLORO_POR_MODO[modoN];
+    const esMetales  = (modoN === 'metales');
+
+    const PISO_MIN = C.CL_MIN_SANITARIO;
+    const PISO_OBJ = C.FC_PISO_ABSOLUTO;
+    const PISO_ALT = 5.0;
+    const PISO_TOX = 10.0;
+    const PISO_SUP = 20.0;
+
+    if (!cyaValido) {
+      return {
+        cl_minimo:      PISO_MIN,
+        cl_objetivo:    esMetales ? null : PISO_OBJ,
+        cl_alto:        esMetales ? null : PISO_ALT,
+        cl_toxico:      PISO_TOX,
+        cl_superchoque: PISO_SUP,
+        cya_referencia: isNaN(cyaN) ? 0 : cyaN,
+        regla_aplicada: 'piso_absoluto',
+        piso_absoluto_aplicado: true,
+        modo_aplicado:  modoN,
+        bloqueo_cloracion: esMetales
+      };
+    }
+
+    return {
+      cl_minimo:      parseFloat((cyaN * C.FC_CYA_MIN_PCT / 100).toFixed(2)),
+      cl_objetivo:    esMetales ? null : parseFloat((cyaN * factores.cl_obj_pct).toFixed(2)),
+      cl_alto:        esMetales ? null : parseFloat((cyaN * factores.cl_alto_pct).toFixed(2)),
+      cl_toxico:      parseFloat((cyaN * C.FC_CYA_TOXICO_PCT / 100).toFixed(2)),
+      cl_superchoque: parseFloat((cyaN * C.FC_CYA_SUPERCHOQUE_PCT / 100).toFixed(2)),
+      cya_referencia: cyaN,
+      regla_aplicada: 'fc_cya_dinamica',
+      piso_absoluto_aplicado: false,
+      modo_aplicado:  modoN,
+      bloqueo_cloracion: esMetales
+    };
+  },
+
+  // ═══════════════════════════════════════════════
+  //  V16.6.0 ADD — Fracción HOCl activa por pH y temperatura
+  // ═══════════════════════════════════════════════
+
+  calcFraccionHOCl(ph, temperatura) {
+    const phN = parseFloat(ph);
+    if (isNaN(phN) || phN < this.CONST.PH_FISICO_MIN || phN > this.CONST.PH_FISICO_MAX) {
+      return NaN;
+    }
+    const tN   = parseFloat(temperatura);
+    const tEff = (isNaN(tN) || tN < 0 || tN > 50) ? 25 : tN;
+    const pKa  = 7.582 - 0.00913 * (tEff - 25);
+    return 1 / (1 + Math.pow(10, phN - pKa));
+  },
+
+  calcHOClActivo(cloroLibre, ph, temperatura) {
+    const clN = parseFloat(cloroLibre);
+    if (isNaN(clN) || clN < 0) return NaN;
+    const f = this.calcFraccionHOCl(ph, temperatura);
+    if (isNaN(f)) return NaN;
+    return parseFloat((clN * f).toFixed(3));
+  },
+
+  _recomendacionISV(ctx) {
+    const { isv, ph, pHs, zonaMin, zonaMax, alk, alkCorr, ch, cya, rec } = ctx;
+    const recomendaciones = [];
+    const dosisAlkalin    = this.CONST.ALKALIN_G_POR_10PPM_10M3;
+
+    if (isv >= zonaMin && isv <= zonaMax) {
+      recomendaciones.push('Agua en equilibrio perfecto con el recubrimiento.');
+      recomendaciones.push('Mantener dosificacion rutinaria de Tricloro 90%.');
+      if (cya >= 50) {
+        const umbCya = this.getUmbralesClorOperativos(cya);
+        recomendaciones.push(
+          'CYA en rango alto (' + cya + ' ppm): Monitorear acumulacion. ' +
+          'Objetivo Cl libre ~' + umbCya.cl_objetivo + ' ppm (regla FC/CYA 10%). ' +
+          'Evaluar retrolavado si supera 75 ppm.'
+        );
+      }
+    } else if (isv < zonaMin) {
+      if (isv < zonaMin - 0.5) {
+        recomendaciones.push('AGUA AGRESIVA CRITICA: Riesgo de corrosion en equipos y estructura.');
+        recomendaciones.push('Accion inmediata: Subir alcalinidad con Alkalin Spin (' + dosisAlkalin + 'g por +10 ppm en 10 m3).');
+        recomendaciones.push('Subir dureza calcica con Cloruro de Calcio si CH < 200 ppm.');
+      } else {
+        recomendaciones.push('Agua ligeramente agresiva: Tendencia corrosiva moderada.');
+        recomendaciones.push('Subir alcalinidad con Alkalin Spin hacia 90-110 ppm.');
+      }
+    } else {
+      if (isv > zonaMax + 0.5) {
+        recomendaciones.push('AGUA INCRUSTANTE CRITICA: Riesgo de depositos en tuberias y equipo.');
+        recomendaciones.push('Accion inmediata: Bajar pH con pH Menos Klaren o Acido Muriatico.');
+        recomendaciones.push('Considerar reduccion de alcalinidad si supera 120 ppm.');
+      } else {
+        recomendaciones.push('Agua ligeramente incrustante: Tendencia a depositar carbonatos.');
+        recomendaciones.push('Bajar pH hacia 7.2-7.4 con pH Menos Klaren en pequenas dosis.');
+      }
+      if (ch > 400) {
+        recomendaciones.push('Dureza muy alta (>400 ppm): Evaluar cambio parcial de agua.');
+      }
+    }
+
+    if (rec === 'fibra' || (typeof rec === 'string' && rec.includes('fibra'))) {
+      recomendaciones.push('Para fibra prefabricada: mantener ISPB ligeramente negativo (-0.1 a +0.1).');
+    } else if (rec === 'pebble' || rec === 'piedra') {
+      recomendaciones.push('Para acabado mineral: tolera mayor incrustacion (+0.5 max).');
+    }
+
+    if (Math.abs(isv) > 0.3) {
+      recomendaciones.push(`pHs calculado: ${pHs.toFixed(2)}. Ajustar quimica para acercar pH a este valor.`);
+    }
+
+    return recomendaciones;
+  },
+
+  // ═══════════════════════════════════════════════
+  //  CALC ISV — Factor Omar / ISPB
+  //  V16.7.0 MOD: Wojtowicz dinámico reemplaza heurística CYA/3
+  // ═══════════════════════════════════════════════
+
+  calcISV(params) {
+    const {
+      ph, temperatura, dureza, alcalinidad,
+      cianurico = 0, tds = 0, recubrimiento = 'porcelanato'
+    } = params || {};
+
+    const phN   = parseFloat(ph);
+    const tempN = parseFloat(temperatura);
+    const durN  = parseFloat(dureza);
+    const alkN  = parseFloat(alcalinidad);
+
+    if (isNaN(phN) || isNaN(tempN) || isNaN(durN) || isNaN(alkN)) return null;
+    if (durN <= 0 || alkN <= 0) return null;
+
+    if (phN < this.CONST.PH_FISICO_MIN || phN > this.CONST.PH_FISICO_MAX) {
+      console.warn('[Chemistry.calcISV] pH fuera de rango físico (' +
+        this.CONST.PH_FISICO_MIN + '-' + this.CONST.PH_FISICO_MAX + '): ' + phN);
+      return null;
+    }
+
+    const cianN = parseFloat(cianurico) || 0;
+    const tdsN  = parseFloat(tds) || 0;
+
+    const F_T  = this._factorTemp(tempN);
+    const F_CH = parseFloat(Math.log10(durN).toFixed(4));
+
+    // V16.7.0 MOD — Wojtowicz dinámico reemplaza heurística CYA/3
+    // La fórmula previa (CYA/3) introducía errores de hasta ±0.04
+    // pHs en los extremos del rango operativo. Crítico para el
+    // Proyector Temporal del ISPB donde el sesgo se acumula.
+    const factorWoj = this._factorWojtowicz(phN);
+    const alkCorr   = Math.max(1, alkN - (cianN * factorWoj));
+    const F_ALK     = parseFloat(Math.log10(alkCorr).toFixed(4));
+
+    let F_TDS = 0;
+    if (tdsN > 1000) {
+      F_TDS = parseFloat((0.1 * Math.log10(tdsN / 1000)).toFixed(4));
+    }
+
+    const LANGELIER_CONST = 12.1;
+    const pHs = parseFloat((LANGELIER_CONST + F_TDS - F_T - F_CH - F_ALK).toFixed(2));
+    const isv = parseFloat((phN - pHs).toFixed(2));
+
+    const zonas = {
+      porcelanato: { min: -0.10, max: 0.30 },
+      veneciano:   { min: -0.10, max: 0.30 },
+      fibra:       { min: -0.30, max: 0.10 },
+      pebble:      { min: -0.20, max: 0.50 },
+      vinil:       { min: -0.30, max: 0.20 },
+      azulejo:     { min: -0.15, max: 0.35 },
+      concreto:    { min: -0.20, max: 0.40 },
+      piedra:      { min: -0.20, max: 0.50 }
+    };
+
+    const zona    = zonas[recubrimiento] || zonas.porcelanato;
+    const zonaMin = zona.min;
+    const zonaMax = zona.max;
+
+    let estado;
+    if (isv < zonaMin - 0.5)       estado = 'Corrosivo Critico';
+    else if (isv < zonaMin)        estado = 'Ligeramente Corrosivo';
+    else if (isv <= zonaMax)       estado = 'Equilibrio Perfecto';
+    else if (isv <= zonaMax + 0.5) estado = 'Ligeramente Incrustante';
+    else                           estado = 'Incrustante Critico';
+
+    const color = this._colorISV(isv, zonaMin, zonaMax);
+
+    const recomendacion = this._recomendacionISV({
+      isv, ph: phN, pHs, zonaMin, zonaMax,
+      alk: alkN, alkCorr, ch: durN, cya: cianN, rec: recubrimiento
+    });
+
+    const F_ALK_sin_cya = parseFloat(Math.log10(alkN).toFixed(4));
+    const isl_ref = parseFloat(
+      (phN + F_T + F_CH + F_ALK_sin_cya - LANGELIER_CONST - F_TDS).toFixed(2)
+    );
+
+    return {
+      isv, pHs, estado, color,
+      F_T:     parseFloat(F_T.toFixed(4)),
+      F_CH:    parseFloat(F_CH.toFixed(4)),
+      F_ALK:   parseFloat(F_ALK.toFixed(4)),
+      F_TDS:   parseFloat(F_TDS.toFixed(4)),
+      alkCorr: parseFloat(alkCorr.toFixed(1)),
+      // V16.7.0 ADD — trazabilidad Wojtowicz
+      wojtowicz_factor: factorWoj,
+      wojtowicz_metodo: 'dinamico_pH',
+      zonaMin, zonaMax, recubrimiento,
+      recomendacion, isl_ref,
+      firma: this.CONST.FIRMA
+    };
+  },
+
+  // ═══════════════════════════════════════════════
+  //  GET ALERTAS — Regla Suprema de Cloracion
+  //  V16.5.3: modo operativo consciente
+  //  V16.5.0: cloro libre evaluado contra umbrales dinámicos FC/CYA
+  // ═══════════════════════════════════════════════
+
+  getAlertas(params, options) {
+    const {
+      ph, cloro_libre, alcalinidad, dureza, cianurico, tds, turbidez,
+      isv = null, nivel_cliente = 'estandar'
+    } = params || {};
+
+    const opts = options || {};
+    const modo = (typeof opts.modo === 'string' && opts.modo) ? opts.modo : 'rutinario';
+
+    const alertas       = [];
+    const isvN          = parseFloat(isv);
+    const isvDisponible = !isNaN(isvN);
+    const isvFueraDeRango = isvDisponible &&
+      (isvN < this.CONST.ISV_SEGURO_MIN || isvN > this.CONST.ISV_SEGURO_MAX);
+    const isvCorrosivo  = isvDisponible && isvN < this.CONST.ISV_SEGURO_MIN;
+    const isvIncrustante = isvDisponible && isvN > this.CONST.ISV_SEGURO_MAX;
+
+    const esPremium          = (nivel_cliente || '').toLowerCase() === 'premium';
+    const alguicidaNombre    = esPremium ? 'Algen Plus Klaren (Premium)' : 'Algen Blue Klaren';
+    const alguicidaProducto  = esPremium ? 'algen-plus' : 'algen-blue';
+    const dosisAlkalin       = this.CONST.ALKALIN_G_POR_10PPM_10M3;
+
+    const cianN = parseFloat(cianurico) || 0;
+    if (cianN >= this.CONST.CYA_CRITICO) {
+      alertas.push({
+        nivel: 'CRITICO', param: 'cianurico', valor: cianN,
+        mensaje: 'CYA CRITICO: ' + cianN + ' ppm (>=' + this.CONST.CYA_CRITICO + ' ppm). Cambio parcial de agua obligatorio (>=50%).',
+        accion: 'Suspender todo tricloro. Cambio de agua inmediato.',
+        producto: null, prioridad: 1
+      });
+    } else if (cianN >= this.CONST.CYA_BLOQUEO) {
+      alertas.push({
+        nivel: 'ADVERTENCIA', param: 'cianurico', valor: cianN,
+        mensaje: 'CYA BLOQUEADO: ' + cianN + ' ppm (>=' + this.CONST.CYA_BLOQUEO + ' ppm). Suspender Tricloro.',
+        accion: 'Cambiar a Hipocalcio Klaren 65% como fuente de cloro.',
+        producto: 'hipoclorito-calcio', prioridad: 2
+      });
+    }
+
+    if (isvFueraDeRango) {
+      if (isvCorrosivo) {
+        alertas.push({
+          nivel: 'CRITICO', param: 'isv', valor: isvN,
+          mensaje: 'ISPB CORROSIVO: ' + isvN + ' (limite: ' + this.CONST.ISV_SEGURO_MIN + '). Agua agresiva. Corregir balance hidrico ANTES de clorar.',
+          accion: 'Subir alcalinidad con Alkalin Spin y/o dureza con Cloruro de Calcio. No agregar cloro hasta estabilizar ISPB.',
+          producto: 'alkalin', prioridad: 1
+        });
+      } else if (isvIncrustante) {
+        alertas.push({
+          nivel: 'CRITICO', param: 'isv', valor: isvN,
+          mensaje: 'ISPB INCRUSTANTE: ' + isvN + ' (limite: +' + this.CONST.ISV_SEGURO_MAX + '). Riesgo de depositos. Corregir balance hidrico ANTES de clorar.',
+          accion: 'Bajar pH y/o alcalinidad con pH Menos Klaren o Acido Muriatico. No agregar cloro hasta estabilizar ISPB.',
+          producto: 'ph-menos', prioridad: 1
+        });
+      }
+    }
+
+    const phN = parseFloat(ph);
+    if (!isNaN(phN)) {
+      if (phN < this.CONST.PH_MIN_CRITICO || phN > this.CONST.PH_MAX_CRITICO) {
+        alertas.push({
+          nivel: 'CRITICO', param: 'ph', valor: phN,
+          mensaje: 'pH CRITICO: ' + phN + ' (rango seguro: ' + this.CONST.PH_MIN_CRITICO + '-' + this.CONST.PH_MAX_CRITICO + '). Ajuste inmediato.',
+          accion: phN < 7.0 ? 'Aplicar Alcalos Spin.' : 'Aplicar pH Menos Klaren o Acido Muriatico.',
+          producto: phN < 7.0 ? 'alcalos' : 'ph-menos', prioridad: 1
+        });
+      } else if (phN < this.CONST.PH_OPTIMO_MIN || phN > this.CONST.PH_OPTIMO_MAX) {
+        alertas.push({
+          nivel: 'ADVERTENCIA', param: 'ph', valor: phN,
+          mensaje: 'pH fuera del optimo: ' + phN + ' (optimo: ' + this.CONST.PH_OPTIMO_MIN + '-' + this.CONST.PH_OPTIMO_MAX + ').',
+          accion: phN < this.CONST.PH_OPTIMO_MIN ? 'Aplicar Alcalos Spin.' : 'Aplicar pH Menos Klaren o Acido Muriatico.',
+          producto: phN < this.CONST.PH_OPTIMO_MIN ? 'alcalos' : 'ph-menos', prioridad: 3
+        });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────
+    // V16.5.3 REFACTOR: Cloro libre evaluado por regla FC/CYA y modo
+    // ─────────────────────────────────────────────────────
+    const clN = parseFloat(cloro_libre);
+    if (!isNaN(clN)) {
+      const umbCl   = this.getUmbralesClorOperativos(cianN, modo);
+      const refCYA  = umbCl.cya_referencia > 0
+        ? '(CYA ' + umbCl.cya_referencia + ' ppm, regla FC/CYA dinamica, modo ' + modo + ')'
+        : '(CYA no medido, pisos absolutos, modo ' + modo + ')';
+      const cloroBloqueado = (umbCl.bloqueo_cloracion === true);
+
+      if (clN >= umbCl.cl_superchoque) {
+        alertas.push({
+          nivel: 'CRITICO', param: 'cloro_libre', valor: clN,
+          mensaje: 'CLORO LIBRE — SUPERCHOQUE: ' + clN + ' ppm (umbral: ' + umbCl.cl_superchoque + ' ppm) ' + refCYA + '. Cierre temporal de la alberca.',
+          accion: 'SUSPENDER toda cloracion. Cambio parcial de agua 30-50% y/o esperar degradacion natural por UV. NO permitir banistas hasta que Cl libre <= ' + umbCl.cl_objetivo + ' ppm.',
+          producto: null, prioridad: 1
+        });
+      } else if (clN >= umbCl.cl_toxico) {
+        alertas.push({
+          nivel: 'CRITICO', param: 'cloro_libre', valor: clN,
+          mensaje: 'CLORO LIBRE TOXICO: ' + clN + ' ppm (umbral: ' + umbCl.cl_toxico + ' ppm) ' + refCYA + '. Riesgo a banistas.',
+          accion: 'Suspender cloracion. Dilucion parcial 20-30% o esperar degradacion natural por UV. Reabrir cuando Cl libre <= ' + umbCl.cl_objetivo + ' ppm.',
+          producto: null, prioridad: 1
+        });
+      } else if (umbCl.cl_alto !== null && clN >= umbCl.cl_alto && modo !== 'rescate' &&
+                 modo !== 'post_choque' && modo !== 'recuperacion_severa') {
+        if (!cloroBloqueado) {
+          alertas.push({
+            nivel: 'ADVERTENCIA', param: 'cloro_libre', valor: clN,
+            mensaje: 'Cloro libre alto: ' + clN + ' ppm (umbral: ' + umbCl.cl_alto + ' ppm) ' + refCYA + '. No permitir banistas hasta normalizar.',
+            accion: 'Reducir dosificacion de Tricloro/Hipocalcio. Esperar degradacion UV o dilucion parcial. Objetivo: ~' + umbCl.cl_objetivo + ' ppm.',
+            producto: null, prioridad: 2
+          });
+        }
+      } else if (clN < umbCl.cl_minimo) {
+        if (!cloroBloqueado) {
+          if (isvFueraDeRango) {
+            alertas.push({
+              nivel: 'CRITICO', param: 'cloro_libre', valor: clN,
+              mensaje: 'CLORO LIBRE CRITICO: ' + clN + ' ppm (minimo: ' + umbCl.cl_minimo + ' ppm) ' + refCYA + '. PERO el ISPB (' + isvN + ') esta fuera de rango seguro. CORREGIR BALANCE HIDRICO PRIMERO.',
+              accion: isvCorrosivo
+                ? 'Primero: estabilizar ISPB subiendo alcalinidad/dureza. Despues: clorar hacia ' + umbCl.cl_objetivo + ' ppm.'
+                : 'Primero: estabilizar ISPB bajando pH/alcalinidad con pH Menos Klaren. Despues: clorar hacia ' + umbCl.cl_objetivo + ' ppm.',
+              producto: isvCorrosivo ? 'alkalin' : 'ph-menos', prioridad: 1
+            });
+          } else {
+            alertas.push({
+              nivel: 'CRITICO', param: 'cloro_libre', valor: clN,
+              mensaje: 'CLORO LIBRE CRITICO: ' + clN + ' ppm (minimo: ' + umbCl.cl_minimo + ' ppm, objetivo: ' + umbCl.cl_objetivo + ' ppm) ' + refCYA + '. Riesgo biologico.' +
+                (isvDisponible ? ' ISPB: ' + isvN + ' (en rango). Cloracion autorizada.' : ' ISPB no disponible. Verificar antes de dosificar.'),
+              accion: cianN >= this.CONST.CYA_BLOQUEO
+                ? 'Aplicar Hipocalcio Klaren 65% (CYA bloqueado). Objetivo: ' + umbCl.cl_objetivo + ' ppm.'
+                : 'Aplicar Tricloro 90% para cloracion de choque. Objetivo: ' + umbCl.cl_objetivo + ' ppm.',
+              producto: cianN >= this.CONST.CYA_BLOQUEO ? 'hipoclorito-calcio' : 'tricloro-polvo', prioridad: 1
+            });
+          }
+        }
+      } else if (clN < umbCl.cl_objetivo) {
+        if (!cloroBloqueado) {
+          if (isvFueraDeRango) {
+            alertas.push({
+              nivel: 'ADVERTENCIA', param: 'cloro_libre', valor: clN,
+              mensaje: 'Cloro libre bajo: ' + clN + ' ppm (objetivo: ' + umbCl.cl_objetivo + ' ppm) ' + refCYA + '. ISPB fuera de rango (' + isvN + '). Estabilizar balance hidrico antes de aumentar cloro.',
+              accion: 'Corregir ISPB primero, luego ajustar cloro hacia ' + umbCl.cl_objetivo + ' ppm.',
+              producto: null, prioridad: 2
+            });
+          } else {
+            alertas.push({
+              nivel: 'ADVERTENCIA', param: 'cloro_libre', valor: clN,
+              mensaje: 'Cloro libre bajo: ' + clN + ' ppm (objetivo: ' + umbCl.cl_objetivo + ' ppm) ' + refCYA + '.' +
+                (isvDisponible ? ' ISPB: ' + isvN + ' (OK).' : ''),
+              accion: cianN >= this.CONST.CYA_BLOQUEO
+                ? 'Usar Hipocalcio Klaren 65%. Objetivo: ' + umbCl.cl_objetivo + ' ppm.'
+                : 'Aumentar dosis de Tricloro 90%. Objetivo: ' + umbCl.cl_objetivo + ' ppm.',
+              producto: cianN >= this.CONST.CYA_BLOQUEO ? 'hipoclorito-calcio' : 'tricloro-polvo', prioridad: 2
+            });
+          }
+        }
+      }
+    }
+
+    const tdsN = parseFloat(tds);
+    if (!isNaN(tdsN)) {
+      if (tdsN >= this.CONST.TDS_CRITICO) {
+        alertas.push({
+          nivel: 'CRITICO', param: 'tds', valor: tdsN,
+          mensaje: 'TDS CRITICO: ' + tdsN + ' ppm (>=' + this.CONST.TDS_CRITICO + ' ppm). Cambio de agua necesario.',
+          accion: 'Cambio parcial de agua (30-50%).',
+          producto: null, prioridad: 2
+        });
+      } else if (tdsN > this.CONST.TDS_OPTIMO_MAX) {
+        alertas.push({
+          nivel: 'ADVERTENCIA', param: 'tds', valor: tdsN,
+          mensaje: 'TDS elevado: ' + tdsN + ' ppm (maximo: ' + this.CONST.TDS_OPTIMO_MAX + ' ppm).',
+          accion: 'Aumentar frecuencia de retrolavados.',
+          producto: null, prioridad: 4
+        });
+      }
+    }
+
+    const alkN = parseFloat(alcalinidad);
+    if (!isNaN(alkN)) {
+      if (alkN < this.CONST.ALK_OPTIMO_MIN) {
+        alertas.push({
+          nivel: 'ADVERTENCIA', param: 'alcalinidad', valor: alkN,
+          mensaje: 'Alcalinidad baja: ' + alkN + ' ppm (optimo: ' + this.CONST.ALK_OPTIMO_MIN + '-' + this.CONST.ALK_OPTIMO_MAX + ' ppm). pH inestable.',
+          accion: 'Aplicar Alkalin Spin: ' + dosisAlkalin + 'g por +10 ppm en 10 m3.',
+          producto: 'alkalin', prioridad: 3
+        });
+      } else if (alkN > this.CONST.ALK_OPTIMO_MAX) {
+        alertas.push({
+          nivel: 'INFO', param: 'alcalinidad', valor: alkN,
+          mensaje: 'Alcalinidad alta: ' + alkN + ' ppm. Puede elevar el pH y causar agua turbia.',
+          accion: 'Reducir con pH Menos Klaren o Acido Muriatico en pequenas dosis.',
+          producto: 'ph-menos', prioridad: 5
+        });
+      }
+    }
+
+    const durN = parseFloat(dureza);
+    if (!isNaN(durN)) {
+      if (durN < this.CONST.CH_OPTIMO_MIN) {
+        alertas.push({
+          nivel: 'ADVERTENCIA', param: 'dureza', valor: durN,
+          mensaje: 'Dureza calcica baja: ' + durN + ' ppm (optimo: ' + this.CONST.CH_OPTIMO_MIN + '-' + this.CONST.CH_OPTIMO_MAX + ' ppm). Riesgo de corrosion.',
+          accion: 'Agregar Cloruro de Calcio: 100g por +10 ppm en 10 m3.',
+          producto: 'cloruro-calcio', prioridad: 4
+        });
+      } else if (durN > this.CONST.CH_OPTIMO_MAX) {
+        alertas.push({
+          nivel: 'INFO', param: 'dureza', valor: durN,
+          mensaje: 'Dureza alta: ' + durN + ' ppm. Contribuye a incrustacion.',
+          accion: 'Evaluar cambio parcial de agua si supera 500 ppm.',
+          producto: null, prioridad: 6
+        });
+      }
+    }
+
+    if (turbidez) {
+      if (turbidez === 'verde' || turbidez === 'cafe' || turbidez === 'café') {
+        alertas.push({
+          nivel: 'CRITICO', param: 'turbidez', valor: turbidez,
+          mensaje: 'TURBIDEZ CRITICA: Agua ' + turbidez + '. Posible proliferacion de algas.',
+          accion: 'Cloracion de choque + ' + alguicidaNombre + '.',
+          producto: alguicidaProducto, prioridad: 1
+        });
+      } else if (turbidez === 'turbia') {
+        alertas.push({
+          nivel: 'ADVERTENCIA', param: 'turbidez', valor: turbidez,
+          mensaje: 'Agua turbia. Verificar filtracion y cloro libre.',
+          accion: 'Aplicar Gold & Clear Klaren como clarificante.',
+          producto: 'gold-and-clear', prioridad: 3
+        });
+      }
+    }
+
+    alertas.sort((a, b) => a.prioridad - b.prioridad);
+    return alertas;
+  },
+
+  calcVolumen(forma, dims) {
+    const largo    = parseFloat(dims.largo)    || 0;
+    const ancho    = parseFloat(dims.ancho)    || 0;
+    const profProm = parseFloat(dims.prof_prom) || 0;
+    let vol = 0;
+    if (forma === 'rectangular') {
+      vol = largo * ancho * profProm;
+    } else if (forma === 'ovalada' || forma === 'oval') {
+      vol = Math.PI * (largo / 2) * (ancho / 2) * profProm;
+    } else if (forma === 'irregular') {
+      const sup = parseFloat(dims.superficie) || largo;
+      vol = sup * profProm;
+    } else {
+      vol = largo * ancho * profProm;
+    }
+    return parseFloat(vol.toFixed(2));
+  },
+
+  // ═══════════════════════════════════════════════
+  //  V15 — FUNCIONES DEL GEMELO DIGITAL VIVO
+  // ═══════════════════════════════════════════════
+
+  // V16.5.1 MOD: parámetro opcional `albedo` ajusta UV efectivo.
+  calcDegradacionCloro(cloro_inicial, horas_transcurridas, iuv, cya, temperatura, albedo) {
+    const cl0   = parseFloat(cloro_inicial) || 0;
+    const horas = parseFloat(horas_transcurridas) || 0;
+    const uvIdx = Math.max(0, parseFloat(iuv) || 0);
+    const cyaN  = Math.max(0, parseFloat(cya) || 0);
+    const tempC = parseFloat(temperatura) || 25;
+
+    if (cl0 <= 0) return 0;
+    if (horas <= 0) return parseFloat(cl0.toFixed(2));
+
+    var albedoUsado = (typeof albedo === 'number' && albedo >= 0 && albedo <= 1)
+                       ? albedo : 0.40;
+    var uvAjustado  = uvIdx * (1 + 0.5 * albedoUsado);
+
+    const k_base    = 0.015;
+    const factor_uv   = 1 + (uvAjustado / 10) * 0.5;
+    const factor_temp = Math.max(0.5, 1 + (tempC - 25) * 0.02);
+    const factor_cya  = Math.max(0.3, 1 - (cyaN / 150));
+    const k           = k_base * factor_uv * factor_temp * factor_cya;
+    const cloro_final = cl0 * Math.exp(-k * horas);
+
+    return parseFloat(Math.max(0, cloro_final).toFixed(2));
+  },
+
+  calcDeltaPhDesgasificacion(ph_inicial, horas_transcurridas, alcalinidad, factor_desgasificacion_co2) {
+    const phI    = parseFloat(ph_inicial) || 7.4;
+    const horas  = parseFloat(horas_transcurridas) || 0;
+    const alk    = parseFloat(alcalinidad) || 100;
+    const factCO2 = Math.max(0, parseFloat(factor_desgasificacion_co2) || 0);
+
+    if (horas <= 0 || factCO2 <= 0) return 0;
+
+    const k_desgasificacion = 0.0015;
+    const factor_buffer     = Math.max(0.2, 1 + (120 - alk) / 100);
+    let delta = k_desgasificacion * horas * factCO2 * factor_buffer;
+
+    const PH_EQUILIBRIO = 8.4;
+    const gap = Math.max(0, PH_EQUILIBRIO - phI);
+    delta = Math.min(delta, gap);
+
+    return parseFloat(Math.max(0, delta).toFixed(3));
+  },
+
+  calcDilucionReposicion(conc_actual_ppm, vol_actual_m3, conc_llenado_ppm, vol_llenado_l) {
+    const cActual    = parseFloat(conc_actual_ppm) || 0;
+    const vActual    = parseFloat(vol_actual_m3)   || 0;
+    const cLlenado   = parseFloat(conc_llenado_ppm) || 0;
+    const vLlenadoL  = parseFloat(vol_llenado_l)   || 0;
+
+    if (vLlenadoL <= 0) return parseFloat(cActual.toFixed(2));
+    if (vActual   <= 0) return parseFloat(cLlenado.toFixed(2));
+
+    const vLlenadoM3 = vLlenadoL / 1000;
+    const vFinal     = vActual + vLlenadoM3;
+    const nuevaConc  = (cActual * vActual + cLlenado * vLlenadoM3) / vFinal;
+
+    return parseFloat(Math.max(0, nuevaConc).toFixed(2));
+  },
+
+  calcConcentracionPostEvaporacion(conc_actual_ppm, vol_inicial_m3, vol_evaporado_l) {
+    const cActual  = parseFloat(conc_actual_ppm) || 0;
+    const vInicial = parseFloat(vol_inicial_m3)  || 0;
+    const vEvapL   = parseFloat(vol_evaporado_l) || 0;
+
+    if (vEvapL   <= 0) return parseFloat(cActual.toFixed(2));
+    if (vInicial <= 0) return parseFloat(cActual.toFixed(2));
+
+    const vEvapM3   = vEvapL / 1000;
+    const vFinal    = Math.max(0.1, vInicial - vEvapM3);
+    const nuevaConc = cActual * (vInicial / vFinal);
+
+    return parseFloat(Math.max(0, nuevaConc).toFixed(2));
+  },
+
+  calcDisolucionSarro(masa_inicial_g, isv_actual, temperatura_c, horas_filtracion) {
+    const masa  = parseFloat(masa_inicial_g)   || 0;
+    const isv   = parseFloat(isv_actual)       || 0;
+    const tempC = parseFloat(temperatura_c)    || 25;
+    const horas = parseFloat(horas_filtracion) || 0;
+
+    if (isv >= 0)  return 0;
+    if (masa <= 0 || horas <= 0) return 0;
+
+    const k_base           = 0.015;
+    const factor_agresividad = Math.abs(isv);
+    const factor_temp      = Math.max(0.5, 1 + (tempC - 25) * 0.02);
+    const k                = k_base * factor_agresividad * factor_temp;
+    const masa_disuelta    = masa * (1 - Math.exp(-k * horas));
+
+    return parseFloat(Math.min(masa, Math.max(0, masa_disuelta)).toFixed(1));
+  },
+
+  protocoloDisolucion9h(masa_sarro_g, isv, temp_c) {
+    const HORAS_PROTOCOLO = 9;
+    const disuelto    = this.calcDisolucionSarro(masa_sarro_g, isv, temp_c, HORAS_PROTOCOLO);
+    const porcentaje  = masa_sarro_g > 0
+      ? parseFloat((disuelto / masa_sarro_g * 100).toFixed(1)) : 0;
+
+    return {
+      horas:             HORAS_PROTOCOLO,
+      masa_inicial_g:    masa_sarro_g,
+      masa_disuelta_g:   disuelto,
+      masa_restante_g:   parseFloat((masa_sarro_g - disuelto).toFixed(1)),
+      porcentaje_disuelto: porcentaje,
+      isv_utilizado:     isv,
+      temperatura_c:     temp_c,
+      protocolo: 'Ley de Compensacion por Disolucion — Pool Balance (modelo empirico propietario, no estandar de industria)',
+      firma: this.CONST.FIRMA
+    };
+  },
+
+  // ═══════════════════════════════════════════════
+  //  CALC HEALTH
+  //  V16.5.3: aplica tope de salud según modo operativo
+  //  V16.5.0: penalización por cloro usa umbrales dinámicos FC/CYA
+  // ═══════════════════════════════════════════════
+
+  calcHealth(params, modo) {
+    const { ph, cloro_libre, alcalinidad, dureza, cianurico, tds } = params || {};
+    let score = 100;
+
+    const phN = parseFloat(ph);
+    if (!isNaN(phN)) {
+      const devPh = Math.abs(phN - 7.4);
+      if (devPh > 1.0)      score -= 25;
+      else if (devPh > 0.4) score -= 15;
+      else if (devPh > 0.2) score -= 5;
+    }
+
+    const clN   = parseFloat(cloro_libre);
+    const cianN = parseFloat(cianurico);
+    if (!isNaN(clN)) {
+      const umbCl = this.getUmbralesClorOperativos(cianN);
+      if (clN < umbCl.cl_minimo)                   score -= 30;
+      else if (clN < umbCl.cl_objetivo * 0.6)      score -= 20;
+      else if (clN < umbCl.cl_objetivo)             score -= 8;
+      if (umbCl.cl_alto !== null && clN > umbCl.cl_alto) score -= 10;
+    }
+
+    if (!isNaN(cianN)) {
+      if (cianN >= this.CONST.CYA_CRITICO)        score -= 20;
+      else if (cianN >= this.CONST.CYA_BLOQUEO)   score -= 12;
+      else if (cianN > 50)                         score -= 5;
+    }
+
+    const alkN = parseFloat(alcalinidad);
+    if (!isNaN(alkN)) {
+      if (alkN < 60 || alkN > 150)      score -= 15;
+      else if (alkN < 80 || alkN > 130) score -= 5;
+    }
+
+    const durN = parseFloat(dureza);
+    if (!isNaN(durN)) {
+      if (durN < 150 || durN > 500)     score -= 10;
+      else if (durN < 200 || durN > 400) score -= 3;
+    }
+
+    const tdsN = parseFloat(tds);
+    if (!isNaN(tdsN)) {
+      if (tdsN >= this.CONST.TDS_CRITICO)   score -= 15;
+      else if (tdsN > this.CONST.TDS_OPTIMO_MAX) score -= 5;
+    }
+
+    score = Math.max(0, Math.min(100, score));
+
+    // V16.5.3: aplicar tope por modo operativo
+    const modoN = (typeof modo === 'string' && this.CONST.TOPES_SALUD_POR_MODO[modo])
+      ? modo : 'rutinario';
+    const tope = this.CONST.TOPES_SALUD_POR_MODO[modoN];
+    score = Math.min(score, tope);
+
+    return {
+      score:         Math.round(score),
+      modo_aplicado: modoN,
+      tope_modo:     tope,
+      firma:         this.CONST.FIRMA
+    };
+  },
+
+  // ═══════════════════════════════════════════════
+  //  V16.5.1 ADD — calcFactorRugosidad
+  // ═══════════════════════════════════════════════
+
+  calcFactorRugosidad(rugosidad) {
+    const mapa = { lisa: 0.85, media: 1.00, rugosa: 1.20 };
+    const key  = (typeof rugosidad === 'string') ? rugosidad.toLowerCase() : 'media';
+    return mapa[key] !== undefined ? mapa[key] : 1.00;
+  },
+
+  // ═══════════════════════════════════════════════
+  //  CALC DOSIFICACION
+  // ═══════════════════════════════════════════════
+
+  calcDosificacion(producto, cam, volumen, ctx) {
+    const C   = this.CONST;
+    const vol = parseFloat(volumen) || 0;
+    if (vol <= 0) return null;
+
+    const context = ctx || {};
+
+    // V16.5.0: soporte para modo_objetivo === 'fc_cya_dinamica'
+    let camEfectivo = parseFloat(cam) || 0;
+    if (camEfectivo <= 0 && context.modo_objetivo === 'fc_cya_dinamica') {
+      const cyaN = parseFloat(context.cianurico) || 0;
+      const clActual = parseFloat(context.cloro_libre_actual) || 0;
+      const umb = this.getUmbralesClorOperativos(cyaN);
+      if (umb.cl_objetivo !== null) {
+        camEfectivo = Math.max(0, umb.cl_objetivo - clActual);
+      }
+    }
+
+    const factorPH = (() => {
+      const phActual  = parseFloat(context.ph_actual)  || 7.4;
+      const phObjetivo = parseFloat(context.ph_objetivo) || 7.4;
+      const phProm    = (phActual + phObjetivo) / 2;
+      if (phProm < 7.2) return 0.85;
+      if (phProm > 7.8) return 1.20;
+      return 1.00;
+    })();
+
+    switch (producto) {
+      case 'tricloro-polvo':
+      case 'tricloro-tableta': {
+        const gramosPorPpm = (1 / C.TRICLORO_CLORO_PCT) * (vol / 10);
+        const gramos = camEfectivo * gramosPorPpm;
+        const deltaCYA = gramos > 0
+          ? parseFloat((gramos * C.TRICLORO_CIAN_PCT / (vol * 1000 / 1000)).toFixed(3))
+          : 0;
+        return {
+          producto, cam: camEfectivo, volumen: vol,
+          gramos:         parseFloat(gramos.toFixed(1)),
+          unidad:         'g',
+          delta_cya_ppm:  deltaCYA,
+          nota: 'Tricloro 90% activo. Vigilar acumulacion de CYA.',
+          firma: C.FIRMA
+        };
+      }
+      case 'hipoclorito-calcio': {
+        const gramosPorPpm = (1 / C.HIPO_CALCIO_CLORO_PCT) * (vol / 10);
+        const gramos = camEfectivo * gramosPorPpm;
+        const deltaDureza = gramos > 0
+          ? parseFloat((gramos * C.HIPO_CALCIO_DUREZA_PPM_G * (10 / vol)).toFixed(2))
+          : 0;
+        return {
+          producto, cam: camEfectivo, volumen: vol,
+          gramos:         parseFloat(gramos.toFixed(1)),
+          unidad:         'g',
+          delta_dureza_ppm: deltaDureza,
+          nota: 'Hipoclorito de calcio 65%. Sube dureza. Usar si CYA >= 75 ppm.',
+          firma: C.FIRMA
+        };
+      }
+      case 'cloro-liquido': {
+        const mlPorPpm = (1 / C.CLORO_LIQUIDO_PCT) * (vol / 10) * 10;
+        const ml = camEfectivo * mlPorPpm;
+        return {
+          producto, cam: camEfectivo, volumen: vol,
+          ml:    parseFloat(ml.toFixed(0)),
+          unidad: 'mL',
+          nota:  'Cloro líquido 10% activo (NaOCl). Aporta ALK (~1.4 ppm por ppm Cl).',
+          firma: C.FIRMA
+        };
+      }
+      case 'ph-menos-klaren':
+      case 'bisulfato': {
+        const deltaPH = parseFloat(context.delta_ph) || 0;
+        if (deltaPH >= 0) return null;
+        const gramosPorPunto = C.PH_MENOS_G_BASE_POR_01PH_10M3 * 10 * (vol / 10);
+        const gramos = Math.abs(deltaPH / 0.1) * gramosPorPunto * factorPH;
+        return {
+          producto, delta_ph: deltaPH, volumen: vol,
+          gramos:    parseFloat(gramos.toFixed(0)),
+          unidad:    'g',
+          nota:      'pH Menos Klaren (NaHSO4 ~50%). Baja pH y algo de ALK. Dosificar en partes.',
+          firma:     C.FIRMA
+        };
+      }
+      case 'acido-muriatico': {
+        const deltaPH = parseFloat(context.delta_ph) || 0;
+        if (deltaPH >= 0) return null;
+        const litrosPorPunto = C.ACIDO_L_POR_PUNTO_PH_10M3 * (vol / 10);
+        const litros = Math.abs(deltaPH) * litrosPorPunto * factorPH;
+        return {
+          producto, delta_ph: deltaPH, volumen: vol,
+          litros:    parseFloat(litros.toFixed(2)),
+          unidad:    'L',
+          nota:      'Ácido muriático 31%. Baja pH y ALK. Extremar precauciones.',
+          firma:     C.FIRMA
+        };
+      }
+      case 'alcalos':
+      case 'soda-ash': {
+        const deltaPH = parseFloat(context.delta_ph) || 0;
+        if (deltaPH <= 0) return null;
+        const gramosPorPunto = C.ALCALOS_G_POR_PUNTO_PH_10M3 * (vol / 10);
+        const gramos = deltaPH * gramosPorPunto;
+        // V16.5.2: hard-stop si delta pH > 2.0
+        if (deltaPH > 2.0) {
+          return {
+            producto, error: true,
+            mensaje: 'HARD-STOP: Delta pH solicitado (' + deltaPH + ') > 2.0. Dividir en dosis menores.',
+            firma: C.FIRMA
+          };
+        }
+        return {
+          producto, delta_ph: deltaPH, volumen: vol,
+          gramos:   parseFloat(gramos.toFixed(0)),
+          unidad:   'g',
+          aviso_ph: deltaPH > 1.0
+            ? 'AVISO ÁMBAR: Delta pH > 1.0. Monitorear pH cada 30 min.' : null,
+          firma:    C.FIRMA
+        };
+      }
+      case 'alkalin': {
+        const deltaALK = parseFloat(context.delta_alk) || 0;
+        if (deltaALK <= 0) return null;
+        const gramosPor10ppm = C.ALKALIN_G_POR_10PPM_10M3 * (vol / 10);
+        const gramos = (deltaALK / 10) * gramosPor10ppm;
+        const deltaPH_col = parseFloat((deltaALK * 0.003).toFixed(3));
+        return {
+          producto, delta_alk: deltaALK, volumen: vol,
+          gramos:       parseFloat(gramos.toFixed(0)),
+          unidad:       'g',
+          delta_ph_colateral: deltaPH_col,
+          nota: 'Alkalin (NaHCO3). Eleva ALK. Colateral: +' + deltaPH_col + ' pH por +' + deltaALK + ' ppm ALK.',
+          firma: C.FIRMA
+        };
+      }
+      case 'goldclear': {
+        const tipo  = context.tipo || 'mantenimiento';
+        const mlM3  = tipo === 'choque'
+          ? C.GOLDCLEAR_ML_CHOQUE_POR_M3 : C.GOLDCLEAR_ML_MANT_POR_M3;
+        const ml    = mlM3 * vol;
+        return {
+          producto, tipo, volumen: vol,
+          ml:   parseFloat(ml.toFixed(0)),
+          unidad: 'mL',
+          nota: 'Gold & Clear Klaren (floculante/clarificante).',
+          firma: C.FIRMA
+        };
+      }
+      case 'cya':
+      case 'cianurico': {
+        const deltaCYA = parseFloat(context.delta_cya) || camEfectivo;
+        if (deltaCYA <= 0) return null;
+        const gramos = deltaCYA * C.CYA_G_POR_PPM_M3 * vol;
+        return {
+          producto, delta_cya: deltaCYA, volumen: vol,
+          gramos:  parseFloat(gramos.toFixed(0)),
+          unidad:  'g',
+          nota:    'Ácido cianúrico / estabilizador. Agregar lentamente.',
+          firma:   C.FIRMA
+        };
+      }
+      case 'cloruro-calcio': {
+        const deltaCH = parseFloat(context.delta_ch) || camEfectivo;
+        if (deltaCH <= 0) return null;
+        const gramosPor10ppm = C.CALCIO_G_POR_10PPM_10M3 * (vol / 10);
+        const gramos = (deltaCH / 10) * gramosPor10ppm;
+        return {
+          producto, delta_ch: deltaCH, volumen: vol,
+          gramos:   parseFloat(gramos.toFixed(0)),
+          unidad:   'g',
+          nota:     'Cloruro de calcio. Eleva dureza cálcica. Disolver antes de agregar.',
+          firma:    C.FIRMA
+        };
+      }
+      case 'algen':
+      case 'alguicida': {
+        const tipo  = context.tipo || 'mantenimiento';
+        const mlM3  = tipo === 'choque'
+          ? C.ALGEN_ML_CHOQUE_POR_M3 : C.ALGEN_ML_MANT_POR_M3;
+        const ml    = mlM3 * vol;
+        return {
+          producto, tipo, volumen: vol,
+          ml:    parseFloat(ml.toFixed(0)),
+          unidad: 'mL',
+          nota:  'Alguicida Klaren (Algen Blue/Plus). Aplicar con bomba en marcha.',
+          firma: C.FIRMA
+        };
+      }
+      case 'magnesio': {
+        const deltaPH = parseFloat(context.delta_ph) || 0;
+        if (deltaPH <= 0) return null;
+        const gramosPorPunto = C.MAGNESIO_G_POR_PUNTO_PH_10M3 * (vol / 10);
+        const gramos = deltaPH * gramosPorPunto;
+        return {
+          producto, delta_ph: deltaPH, volumen: vol,
+          gramos:  parseFloat(gramos.toFixed(0)),
+          unidad:  'g',
+          nota:    'Magnesio (subidor de pH suave). Alternativa al Alcalos para ajustes finos.',
+          firma:   C.FIRMA
+        };
+      }
+      default:
+        return null;
+    }
+  },
+
+  // ═══════════════════════════════════════════════
+  //  CALC DELTA POR APLICACION
+  //  V16.4.2 ADD — V16.4.3/4/5 FIX
+  // ═══════════════════════════════════════════════
+
+  calcDeltaPorAplicacion(producto, cantidad, volumen, ctx) {
+    const C   = this.CONST;
+    const vol = parseFloat(volumen) || 0;
+    if (vol <= 0) return null;
+
+    const context  = ctx || {};
+    const phActual  = parseFloat(context.ph_actual)   || 7.4;
+    const phObjetivo = parseFloat(context.ph_objetivo) || 7.4;
+    const phProm    = (phActual + phObjetivo) / 2;
+
+    const factorPH = (() => {
+      if (phProm < 7.2) return 0.85;
+      if (phProm > 7.8) return 1.20;
+      return 1.00;
+    })();
+
+    const impactoMasa = { deltaPH: 0, deltaALK: 0, deltaCL: 0, deltaCYA: 0, deltaCH: 0 };
+
+    switch (producto) {
+      case 'tricloro-polvo':
+      case 'tricloro-tableta': {
+        const gramos = parseFloat(cantidad) || 0;
+        impactoMasa.deltaCL  = parseFloat((gramos * C.TRICLORO_CLORO_PCT / (vol * 100)).toFixed(3));
+        impactoMasa.deltaCYA = parseFloat((gramos * C.TRICLORO_CIAN_PCT  / (vol * 100)).toFixed(3));
+        impactoMasa.deltaPH  = parseFloat((-0.020 * gramos / vol).toFixed(3));
+        break;
+      }
+      case 'hipoclorito-calcio': {
+        const gramos = parseFloat(cantidad) || 0;
+        impactoMasa.deltaCL = parseFloat((gramos * C.HIPO_CALCIO_CLORO_PCT / (vol * 100)).toFixed(3));
+        impactoMasa.deltaCH = parseFloat((gramos * C.HIPO_CALCIO_DUREZA_PPM_G * (10 / vol)).toFixed(2));
+        break;
+      }
+      case 'cloro-liquido': {
+        const ml = parseFloat(cantidad) || 0;
+        impactoMasa.deltaCL  = parseFloat((ml * C.CLORO_LIQUIDO_PCT / (vol * 10)).toFixed(3));
+        impactoMasa.deltaALK = parseFloat((impactoMasa.deltaCL * C.NAOCL_DELTA_ALK_POR_PPM_CL).toFixed(3));
+        break;
+      }
+      case 'ph-menos-klaren':
+      case 'bisulfato': {
+        const gramos = parseFloat(cantidad) || 0;
+        const factorBase = C.PH_MENOS_G_BASE_POR_01PH_10M3 * 10 * (vol / 10);
+        impactoMasa.deltaPH  = parseFloat((-0.1 * (gramos / factorBase) / factorPH).toFixed(3));
+        impactoMasa.deltaALK = parseFloat((-gramos / (C.NAHSO4_G_POR_PPM_ALK_10M3 * (vol / 10))).toFixed(3));
+        break;
+      }
+      case 'acido-muriatico': {
+        const litros = parseFloat(cantidad) || 0;
+        // V16.4.5 FIX LITERAL-MAGICO
+        const litrosPorPunto = C.ACIDO_L_POR_PUNTO_PH_10M3 * (vol / 10);
+        impactoMasa.deltaPH  = parseFloat((-litros / (litrosPorPunto * factorPH)).toFixed(3));
+        impactoMasa.deltaALK = parseFloat((-litros * C.HCL_PPM_ALK_POR_LITRO_10M3 * (10 / vol)).toFixed(3));
+        break;
+      }
+      case 'alcalos':
+      case 'soda-ash': {
+        const gramos = parseFloat(cantidad) || 0;
+        const gramosPorPunto = C.ALCALOS_G_POR_PUNTO_PH_10M3 * (vol / 10);
+        impactoMasa.deltaPH  = parseFloat((gramos / (gramosPorPunto * factorPH)).toFixed(3));
+        impactoMasa.deltaPH  = impactoMasa.deltaPH === -0 ? 0 : impactoMasa.deltaPH;
+        break;
+      }
+      case 'alkalin': {
+        const gramos = parseFloat(cantidad) || 0;
+        const gramosPor10ppm = C.ALKALIN_G_POR_10PPM_10M3 * (vol / 10);
+        impactoMasa.deltaALK = parseFloat((gramos / gramosPor10ppm * 10).toFixed(3));
+        impactoMasa.deltaPH  = 0; // V16.4.5 FIX -0: siempre 0 en modo alk
+        break;
+      }
+      case 'cloruro-calcio': {
+        const gramos = parseFloat(cantidad) || 0;
+        const gramosPor10ppm = C.CALCIO_G_POR_10PPM_10M3 * (vol / 10);
+        impactoMasa.deltaCH  = parseFloat((gramos / gramosPor10ppm * 10).toFixed(2));
+        break;
+      }
+      default:
+        return null;
+    }
+
+    return {
+      producto, cantidad, volumen: vol,
+      impactoMasa,
+      firma: C.FIRMA
+    };
+  },
+
+  // ━━━ INICIO P.5 — Función pública proyectarISPB v16.7.0 ━━━
+
+  /**
+   * Proyecta la evolución del ISPB en el tiempo bajo desgasificación
+   * natural, evaporación y eventos programados. Integración Euler
+   * con paso de 1 h. Sección 14 del Códyce.
+   *
+   * @param {object} estadoInicial - {pH, ALK, CH, CYA, TDS, FC,
+   *   temperatura, recubrimiento, profundidad, regimen_aireacion,
+   *   evaporacion_mm_dia, volumen_m3, modo_operativo}
+   * @param {number} horizonte_h - horas a proyectar (1..168)
+   * @param {Array}  eventos - [{hora, tipo, ...payload}]
+   * @param {object} opciones - {forzar:bool}
+   * @returns {object} estructura doctrinal Sección 14.6
+   */
+  proyectarISPB(estadoInicial, horizonte_h, eventos, opciones) {
+    const opts = opciones || {};
+
+    // ───── 1. VALIDACIÓN DE INPUTS ─────
+    if (!estadoInicial || typeof estadoInicial !== 'object') {
+      return { error: true, mensaje: 'estadoInicial requerido (objeto).' };
+    }
+    const requeridos = ['pH', 'ALK', 'CH', 'temperatura', 'volumen_m3'];
+    for (const k of requeridos) {
+      if (estadoInicial[k] === undefined || estadoInicial[k] === null) {
+        return { error: true, mensaje: 'Campo requerido faltante: ' + k };
+      }
+    }
+
+    let H = parseInt(horizonte_h, 10);
+    if (isNaN(H) || H < 1) H = 24;
+    if (H > this.CONST.PROYECTOR_HORIZONTE_MAX) H = this.CONST.PROYECTOR_HORIZONTE_MAX;
+
+    // ───── 2. MODO OPERATIVO PROHIBIDO (Sección 14.8.3) ─────
+    const modo = String(estadoInicial.modo_operativo || 'rutinario').toLowerCase();
+    if (this.CONST.PROYECTOR_MODOS_PROHIBIDOS.indexOf(modo) !== -1 && !opts.forzar) {
+      return {
+        error: true,
+        bloqueado: true,
+        mensaje: 'Proyección bloqueada: modo "' + modo + '" no admite proyección ' +
+                 '(usar opciones.forzar=true bajo responsabilidad del técnico).'
+      };
+    }
+
+    // ───── 3. RÉGIMEN DE AIREACIÓN ─────
+    const regimen = String(estadoInicial.regimen_aireacion || 'filtracion').toLowerCase();
+    const velBase = this.CONST.DESGASIFICACION_VEL_BASE[regimen];
+    if (velBase === undefined) {
+      return { error: true, mensaje: 'regimen_aireacion no reconocido: ' + regimen };
+    }
+
+    // ───── 4. ZONA DE RECUBRIMIENTO ─────
+    const zona = this._zonaSeguridadRecubrimiento(estadoInicial.recubrimiento);
+
+    // ───── 5. ADVERTENCIAS NO BLOQUEANTES ─────
+    const advertencias = [];
+    if ((estadoInicial.CYA || 0) > 75) {
+      advertencias.push('CYA elevado (' + estadoInicial.CYA +
+        ' ppm): Sección 14.8.3(d) recomienda retrolavado/dilución previa.');
+    }
+
+    // ───── 6. ESTADO DE TRABAJO ─────
+    const estado = {
+      pH:          parseFloat(estadoInicial.pH),
+      ALK:         parseFloat(estadoInicial.ALK),
+      CH:          parseFloat(estadoInicial.CH),
+      CYA:         parseFloat(estadoInicial.CYA  || 0),
+      TDS:         parseFloat(estadoInicial.TDS  || 0),
+      FC:          parseFloat(estadoInicial.FC   || 0),
+      temperatura: parseFloat(estadoInicial.temperatura),
+      profundidad: parseFloat(estadoInicial.profundidad || 1.5)
+    };
+    const V_m3      = parseFloat(estadoInicial.volumen_m3);
+    const evapMmDia = parseFloat(estadoInicial.evaporacion_mm_dia ||
+                                 this.CONST.EVAPORACION_MM_DIA_DEFAULT);
+
+    // F_T constante en el horizonte (Sección 14.4)
+    const F_T = this._factorTemp(estado.temperatura);
+
+    // ───── 7. INDEXAR EVENTOS POR HORA ─────
+    const eventosPorHora = {};
+    if (Array.isArray(eventos)) {
+      for (const ev of eventos) {
+        const h = parseInt(ev.hora, 10);
+        if (!isNaN(h) && h >= 0 && h <= H) {
+          if (!eventosPorHora[h]) eventosPorHora[h] = [];
+          eventosPorHora[h].push(ev);
+        }
+      }
+    }
+
+    // ───── 8. PUNTO INICIAL ─────
+    this._recalcularPHsProyector(estado, F_T);
+    const ispb_inicial = estado.ispb;
+    const en_zona_ini  = (ispb_inicial >= zona.min && ispb_inicial <= zona.max);
+
+    const curva = [];
+    curva.push({
+      h:                0,
+      pH:               parseFloat(estado.pH.toFixed(3)),
+      T_agua:           estado.temperatura,
+      ALK:              parseFloat(estado.ALK.toFixed(1)),
+      ALK_corr:         estado.alkCorr,
+      CH:               parseFloat(estado.CH.toFixed(1)),
+      CYA:              parseFloat(estado.CYA.toFixed(1)),
+      TDS:              parseFloat((estado.TDS || 0).toFixed(0)),
+      pHs:              estado.pHs,
+      ISPB:             estado.ispb,
+      en_zona:          en_zona_ini,
+      factor_wojtowicz: estado.wojtowicz_factor
+    });
+
+    // ───── 9. INTEGRACIÓN EULER ─────
+    let alerta_salida       = null;
+    const racha_fuera       = [];
+
+    for (let h = 1; h <= H; h++) {
+      // 9.1 Desgasificación con techo suavizado
+      const techo = this._techoSuavizadoDesgasificacion(estado.pH);
+      estado.pH = estado.pH + velBase * techo;
+
+      // 9.2 Evaporación (concentra iones)
+      const fEvap = this._evaporacionFactorHora(estado.profundidad, evapMmDia);
+      estado.ALK = estado.ALK * fEvap;
+      estado.CH  = estado.CH  * fEvap;
+      estado.CYA = estado.CYA * fEvap;
+      estado.TDS = (estado.TDS || 0) * fEvap;
+
+      // 9.3 Eventos programados a esta hora
+      if (eventosPorHora[h]) {
+        for (const ev of eventosPorHora[h]) {
+          this._aplicarEventoProyector(estado, ev, V_m3);
+        }
+      }
+
+      // 9.4 Clamp físico
+      if (estado.pH < this.CONST.PH_FISICO_MIN) estado.pH = this.CONST.PH_FISICO_MIN;
+      if (estado.pH > this.CONST.PH_FISICO_MAX) estado.pH = this.CONST.PH_FISICO_MAX;
+      if (estado.ALK < 1)  estado.ALK = 1;
+      if (estado.CH  < 1)  estado.CH  = 1;
+      if (estado.CYA < 0)  estado.CYA = 0;
+      if (estado.FC  < 0)  estado.FC  = 0;
+
+      // 9.5 Recalcular pHs / ISPB
+      this._recalcularPHsProyector(estado, F_T);
+
+      // 9.6 Detección de cruce con confirmación de 3 puntos (Sección 14.2.3)
+      const fueraIncr = estado.ispb > zona.max;
+      const fueraCorr = estado.ispb < zona.min;
+      const en_zona   = !(fueraIncr || fueraCorr);
+
+      if (!en_zona) {
+        racha_fuera.push({
+          hora:      h,
+          ispb:      estado.ispb,
+          direccion: fueraIncr ? 'incrustante' : 'corrosivo',
+          umbral:    fueraIncr ? zona.max : zona.min
+        });
+        if (racha_fuera.length >= this.CONST.PROYECTOR_PUNTOS_CRUCE_CONFIRMACION &&
+            !alerta_salida) {
+          const inicio = racha_fuera[racha_fuera.length -
+                                     this.CONST.PROYECTOR_PUNTOS_CRUCE_CONFIRMACION];
+          alerta_salida = {
+            hora:           inicio.hora,
+            direccion:      inicio.direccion,
+            ISPB_en_cruce:  parseFloat(inicio.ispb.toFixed(3)),
+            magnitud_cruce: parseFloat(Math.abs(inicio.ispb - inicio.umbral).toFixed(3)),
+            umbral_violado: inicio.umbral
+          };
+        }
+      } else {
+        racha_fuera.length = 0;
+      }
+
+      // 9.7 Añadir punto a la curva
+      curva.push({
+        h:                h,
+        pH:               parseFloat(estado.pH.toFixed(3)),
+        T_agua:           estado.temperatura,
+        ALK:              parseFloat(estado.ALK.toFixed(1)),
+        ALK_corr:         estado.alkCorr,
+        CH:               parseFloat(estado.CH.toFixed(1)),
+        CYA:              parseFloat(estado.CYA.toFixed(1)),
+        TDS:              parseFloat((estado.TDS || 0).toFixed(0)),
+        pHs:              estado.pHs,
+        ISPB:             estado.ispb,
+        en_zona:          en_zona,
+        factor_wojtowicz: estado.wojtowicz_factor
+      });
+    }
+
+    // ───── 10. RESUMEN A HORAS CLAVE (Sección 14.6) ─────
+    const horasResumen = [0, 24, 48, 72].filter(function(h) { return h <= H; });
+    const resumen = {};
+    horasResumen.forEach(function(h) {
+      if (curva[h]) {
+        const key = (h === 0) ? 't0' : 'h' + h;
+        resumen[key] = { ISPB: curva[h].ISPB, en_zona: curva[h].en_zona };
+      }
+    });
+
+    // ───── 11. RECOMENDACIÓN ─────
+    const recomendacion = this._proyectorRecomendacion(alerta_salida, zona, H, regimen);
+
+    // ───── 12. RETORNO ESTRUCTURADO (Sección 14.6) ─────
+    return {
+      version:           '16.7.0',
+      estadoInicial: {
+        pH:            estadoInicial.pH,
+        ISPB:          ispb_inicial,
+        recubrimiento: zona.recubrimiento
+      },
+      horizonte_h:        H,
+      regimen_aireacion:  regimen,
+      curva:              curva,
+      resumen:            resumen,
+      alerta_salida:      alerta_salida,
+      recomendacion:      recomendacion,
+      zona_recubrimiento: { min: zona.min, max: zona.max },
+      advertencias:       advertencias,
+      integracion_F:      (typeof this.calcDeltaPhPorDosificacion === 'function'),
+      firma:              this.CONST.FIRMA
+    };
+  }
+
+  // ━━━ FIN P.5 ━━━
+
+}; // fin del objeto Chemistry
+
+// ━━━ INICIO P.6 — Suite de tests del Proyector v16.7.0 ━━━
+// Sección 14.10 del Códyce — Criterio de promoción: 6/6 verde.
+
+const TESTS_PROYECTOR_V17_8 = [
+
+  // T_PROJ_01 — Estabilidad en reposo sin eventos
+  {
+    id: 'T_PROJ_01',
+    descripcion: 'Estabilidad en reposo sin eventos: ISPB no cruza zona en 48 h.',
+    input: {
+      estadoInicial: {
+        pH: 7.40, ALK: 100, CH: 300, CYA: 40, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'reposo', volumen_m3: 50
+      },
+      horizonte_h: 48, eventos: []
+    },
+    esperado: function(r) { return r.alerta_salida === null; }
+  },
+
+  // T_PROJ_02 — Cruce incrustante por cascada
+  {
+    id: 'T_PROJ_02',
+    descripcion: 'Cascada eleva pH hasta cruzar zona incrustante.',
+    input: {
+      estadoInicial: {
+        pH: 7.80, ALK: 110, CH: 350, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'cascada', volumen_m3: 50
+      },
+      horizonte_h: 48, eventos: []
+    },
+    esperado: function(r) {
+      return r.alerta_salida && r.alerta_salida.direccion === 'incrustante';
+    }
+  },
+
+  // T_PROJ_03 — Dosis ácida retrasa o evita cruce (blindado)
+  {
+    id: 'T_PROJ_03',
+    descripcion: 'Dosis de bisulfato a h=12 retrasa o evita cruce de zona.',
+    input: {
+      estadoInicial: {
+        pH: 7.80, ALK: 110, CH: 350, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'cascada', volumen_m3: 50
+      },
+      horizonte_h: 48,
+      eventos: [{ hora: 12, tipo: 'dosis_bisulfato_klaren', cantidad_g: 1500 }]
+    },
+    esperado: function(r, baseline) {
+      if (!baseline || baseline.error || !baseline.alerta_salida) {
+        return !r.alerta_salida || r.alerta_salida.hora > 24;
+      }
+      return !r.alerta_salida || r.alerta_salida.hora > baseline.alerta_salida.hora;
+    }
+  },
+
+  // T_PROJ_04 — Suavizado de techo
+  {
+    id: 'T_PROJ_04',
+    descripcion: 'Aún con cascada 168 h, pH se asintota debajo de 8.5.',
+    input: {
+      estadoInicial: {
+        pH: 7.90, ALK: 120, CH: 350, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'cascada', volumen_m3: 50
+      },
+      horizonte_h: 168, eventos: []
+    },
+    esperado: function(r) { return r.curva[r.curva.length - 1].pH < 8.5; }
+  },
+
+  // T_PROJ_05 — Dependencia de recubrimiento
+  {
+    id: 'T_PROJ_05',
+    descripcion: 'Recubrimiento fibra es más estricto que pebble.',
+    input: {
+      estadoInicial: {
+        pH: 7.60, ALK: 100, CH: 320, CYA: 30, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'fibra', profundidad: 1.5,
+        regimen_aireacion: 'filtracion', volumen_m3: 50
+      },
+      horizonte_h: 72, eventos: []
+    },
+    esperado: function(r) { return r.zona_recubrimiento.max === 0.10; }
+  },
+
+  // T_PROJ_06 — Estructura de la curva
+  {
+    id: 'T_PROJ_06',
+    descripcion: 'Curva tiene horizonte_h+1 puntos y campos completos doctrinales.',
+    input: {
+      estadoInicial: {
+        pH: 7.40, ALK: 100, CH: 300, CYA: 40, TDS: 1200, FC: 2.0,
+        temperatura: 28, recubrimiento: 'porcelanato', profundidad: 1.5,
+        regimen_aireacion: 'filtracion', volumen_m3: 50
+      },
+      horizonte_h: 24, eventos: []
+    },
+    esperado: function(r) {
+      if (r.curva.length !== 25) return false;
+      const punto = r.curva[12];
+      return typeof punto.pH               === 'number' &&
+             typeof punto.ISPB             === 'number' &&
+             typeof punto.ALK              === 'number' &&
+             typeof punto.ALK_corr         === 'number' &&
+             typeof punto.pHs              === 'number' &&
+             typeof punto.en_zona          === 'boolean' &&
+             typeof punto.factor_wojtowicz === 'number';
+    }
+  }
+
+];
+
+function ejecutarTestsProyector() {
+  const resultados = [];
+  let pasados = 0, fallados = 0;
+
+  // Baseline para T_PROJ_03: ejecutar T_PROJ_02 primero (sin dosis)
+  let baseline = null;
+  try {
+    const tBase = TESTS_PROYECTOR_V17_8.find(function(t) { return t.id === 'T_PROJ_02'; });
+    if (tBase) baseline = Chemistry.proyectarISPB(
+      tBase.input.estadoInicial, tBase.input.horizonte_h, tBase.input.eventos
+    );
+  } catch (e) {
+    baseline = null;
+  }
+
+  for (var i = 0; i < TESTS_PROYECTOR_V17_8.length; i++) {
+    const t = TESTS_PROYECTOR_V17_8[i];
+    try {
+      const r  = Chemistry.proyectarISPB(
+        t.input.estadoInicial, t.input.horizonte_h, t.input.eventos
+      );
+      const ok = !!t.esperado(r, baseline);
+      resultados.push({ id: t.id, descripcion: t.descripcion, pasado: ok });
+      if (ok) pasados++; else fallados++;
+    } catch (e) {
+      resultados.push({
+        id: t.id, descripcion: t.descripcion, pasado: false,
+        error: e.message
+      });
+      fallados++;
+    }
+  }
+
+  const reporte = {
+    total:    TESTS_PROYECTOR_V17_8.length,
+    pasados:  pasados,
+    fallados: fallados,
+    veredicto: (fallados === 0)
+                 ? '✅ 6/6 VERDE — listo para validación retrospectiva (V2)'
+                 : '❌ Hay tests fallando — NO promover',
+    detalle:  resultados
+  };
+
+  console.log('[Proyector v16.7.0] Tests:', reporte.veredicto);
+  if (typeof console.table === 'function') console.table(resultados);
+  return reporte;
+}
+
+// Exponer al objeto Chemistry para invocación uniforme
+Chemistry.ejecutarTestsProyector = ejecutarTestsProyector;
+
+// ━━━ FIN P.6 ━━━
+
+// ━━━ INICIO P.7 — Export Node/CommonJS v16.7.0 ━━━
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = Chemistry;
+  module.exports.proyectarISPB          = Chemistry.proyectarISPB.bind(Chemistry);
+  module.exports.TESTS_PROYECTOR_V17_8  = TESTS_PROYECTOR_V17_8;
+  module.exports.ejecutarTestsProyector = ejecutarTestsProyector;
+}
+
+if (typeof window !== 'undefined') {
+  window.Chemistry = Chemistry;
+}
+
+// ━━━ FIN P.7 ━━━
+
+// ═══════════════════════════════════════════════
+//  BOOT-ASSERT — Verificación de constantes críticas al cargar
+//  V16.5.0: amplía a 26 constantes + coherencia ordinal FC/CYA
+//  V16.4.5: IIFE de verificación
+// ═══════════════════════════════════════════════
+
+;(function() {
+  'use strict';
+  const C = Chemistry.CONST;
+  const errores = [];
+
+  // Constantes calibradas inmutables
+  const verificaciones = [
+    ['NAHSO4_G_POR_PPM_ALK_10M3', C.NAHSO4_G_POR_PPM_ALK_10M3,     50.94],
+    ['NAHCO3_G_POR_PPM_ALK_10M3', C.NAHCO3_G_POR_PPM_ALK_10M3,     16.78],
+    ['PH_MENOS_G_BASE_POR_01PH_10M3', C.PH_MENOS_G_BASE_POR_01PH_10M3, 55],
+    ['ALKALIN_G_POR_10PPM_10M3',  C.ALKALIN_G_POR_10PPM_10M3,     168],
+    ['FC_CYA_MIN_PCT',            C.FC_CYA_MIN_PCT,                7.5],
+    ['FC_CYA_OBJ_PCT',            C.FC_CYA_OBJ_PCT,                10],
+    ['FC_CYA_ALTO_PCT',           C.FC_CYA_ALTO_PCT,               30],
+    ['FC_CYA_TOXICO_PCT',         C.FC_CYA_TOXICO_PCT,             50],
+    ['FC_CYA_SUPERCHOQUE_PCT',    C.FC_CYA_SUPERCHOQUE_PCT,        80],
+    ['FC_PISO_ABSOLUTO',          C.FC_PISO_ABSOLUTO,              1.5],
+    ['CL_MIN_SANITARIO',          C.CL_MIN_SANITARIO,              0.5],
+    ['CL_OPTIMO_MIN',             C.CL_OPTIMO_MIN,                 1.0],
+    ['CYA_BLOQUEO',               C.CYA_BLOQUEO,                   75],
+    ['CYA_CRITICO',               C.CYA_CRITICO,                   100],
+    ['PH_MIN_CRITICO',            C.PH_MIN_CRITICO,                7.0],
+    ['PH_MAX_CRITICO',            C.PH_MAX_CRITICO,                8.0],
+    ['PH_OPTIMO_MIN',             C.PH_OPTIMO_MIN,                 7.2],
+    ['PH_OPTIMO_MAX',             C.PH_OPTIMO_MAX,                 7.6],
+    ['ALK_OPTIMO_MIN',            C.ALK_OPTIMO_MIN,                80],
+    ['ALK_OPTIMO_MAX',            C.ALK_OPTIMO_MAX,                120],
+    ['ISV_SEGURO_MIN',            C.ISV_SEGURO_MIN,               -0.3],
+    ['ISV_SEGURO_MAX',            C.ISV_SEGURO_MAX,                0.3],
+    ['TDS_OPTIMO_MAX',            C.TDS_OPTIMO_MAX,                1500],
+    ['TDS_CRITICO',               C.TDS_CRITICO,                   2000],
+    ['HCL_PPM_ALK_POR_LITRO_10M3', C.HCL_PPM_ALK_POR_LITRO_10M3,  50],
+    ['NAOCL_DELTA_ALK_POR_PPM_CL', C.NAOCL_DELTA_ALK_POR_PPM_CL,  1.4]
+  ];
+
+  verificaciones.forEach(function(v) {
+    if (v[1] !== v[2]) {
+      errores.push('CONST.' + v[0] + ' esperado ' + v[2] + ' encontrado ' + v[1]);
+    }
+  });
+
+  // Coherencia ordinal FC/CYA
+  if (!(C.FC_CYA_MIN_PCT < C.FC_CYA_OBJ_PCT &&
+        C.FC_CYA_OBJ_PCT < C.FC_CYA_ALTO_PCT &&
+        C.FC_CYA_ALTO_PCT < C.FC_CYA_TOXICO_PCT &&
+        C.FC_CYA_TOXICO_PCT < C.FC_CYA_SUPERCHOQUE_PCT)) {
+    errores.push('Coherencia ordinal FC_CYA_*_PCT violada');
+  }
+
+  // Verificar Wojtowicz tabla presente y con 8 puntos
+  if (!C.WOJTOWICZ_TABLA || C.WOJTOWICZ_TABLA.length !== 8) {
+    errores.push('WOJTOWICZ_TABLA: se esperan 8 puntos, encontrados ' +
+      (C.WOJTOWICZ_TABLA ? C.WOJTOWICZ_TABLA.length : 'ausente'));
+  }
+
+  // Verificar proyector constantes presentes
+  if (!C.DESGASIFICACION_VEL_BASE || !C.DESGASIFICACION_VEL_BASE.filtracion) {
+    errores.push('DESGASIFICACION_VEL_BASE: estructura inválida o ausente');
+  }
+  if (!C.PROYECTOR_COEF_DOSIS || !C.PROYECTOR_COEF_DOSIS.dosis_tricloro) {
+    errores.push('PROYECTOR_COEF_DOSIS: estructura inválida o ausente');
+  }
+
+  if (errores.length > 0) {
+    const msg = '[Chemistry v' + Chemistry.VERSION + '] BOOT-ASSERT FALLÓ:\n' +
+                errores.join('\n');
+    console.error(msg);
+    throw new Error(msg);
+  }
+
+  console.log('[Chemistry v' + Chemistry.VERSION + '] Boot-assert OK — ' +
+    verificaciones.length + ' constantes críticas verificadas + ' +
+    'Wojtowicz + Proyector.');
+}());
