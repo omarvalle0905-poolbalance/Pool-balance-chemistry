@@ -1,0 +1,2538 @@
+// ============================================================
+// ARCHIVO: js/ — La Joya de la Corona de Pool Balance V15
+// Puente entre el Técnico y el Gemelo Digital Ciber-Físico
+// ============================================================
+
+/**
+ * @file bitacora.js
+ * @description Módulo de Bitácora de Servicio para Pool Balance V15.
+ * Captura todos los datos de campo del técnico y los traduce
+ * en eventos que alimentan al Gemelo Digital.
+ *
+ * Cadena de verdad:
+ * Técnico → Bitácora (este archivo) → DB + EventBus →
+ * Engine → Chemistry → PoolState actualizado
+ *
+ * REGLA: Este módulo SÍ interactúa con el DOM.
+ * NO contiene lógica de negocio química.
+ * Delega cálculos a Chemistry y Calculadoras.
+ *
+ * @author Omar Alberto Valle Mercado | VAMO870509HW3
+ * @version 17.2.4
+ * @depends window.DB, window.EventBus, window.Chemistry, window.Calculadoras, window.Engine
+ *
+ * V17.2.4 — FIX BUG-DELTA-PH-RESCATE: en modos 'rescate',
+ *   'recuperacion_severa' o cuando ALK < 80 ppm, la dosificación
+ *   de ácido muriático y tricloro usa Chemistry.calcDeltaPhPorDosificacion
+ *   (Entregable F, solver termodinámico) en lugar de la heurística CPO.
+ *   Corrige subestimación sistemática de ~40 % del ΔpH en albercas
+ *   tamponadas débilmente. Marcas: // V17.2.4 FIX DELTA-PH-RESCATE.
+ *
+ * V17.2.3 — FIX N-02: persistencia vía DB.saveServicio. FIX BUG-007: evento
+ *   bitacora:diagnostico_anclado con salud completa y Engine.proyectarEstadoActual forzado.
+ *   FIX BUG-002: bloqueo de cloro en modo metales.
+ *
+ * V17.2.2 — FIX BUG-002: _renderPreviewImpacto ahora lee poolState real
+ *   desde DB.getPoolState(_albercaActivaId) en lugar de hardcodear
+ *   modo_operativo = 'rutinario'. El hard-stop de cloro para modo
+ *   'metales' ahora funciona correctamente en el preview de dosis.
+ *
+ * V17.2.1 — Hotfix crítico de integración:
+ *   - _anclarDiagnostico: elimina llamada duplicada a Engine.recalcularTrasEvento
+ *     que sobrescribía el modo_operativo correcto. El engine ahora procesa
+ *     exclusivamente a través del listener de EventBus 'bitacora:diagnostico_anclado'.
+ *   - _anclarDiagnostico: los datos se envían planos en el primer nivel del payload,
+ *     sin envoltorio 'datos'.
+ *
+ * V17.2.0 — Refactor completo a spec V17.2 (bitácora)
+ *   - 6 tipos de servicio nuevos (TIPOS_SERVICIO).
+ *   - Constantes NIVELES_CLARIDAD, TIPOS_ALGA, NATURALEZAS_COLOR,
+ *     OLORES, NIVELES_VASO, FUENTES_AGUA congeladas.
+ *   - UMBRALES_DOSIS estática REMOVIDA. Reemplazada por
+ *     _getUmbralesDosisActuales() que escala según modo_operativo
+ *     y CYA actual del gemelo. Resuelve E2.
+ *   - _evaluarOverrideTipoServicio: banner ámbar bidireccional
+ *     persistente. NO fuerza cambios. V17.2 sec 5.1.
+ *   - _anclarDiagnostico: nueva función. Persiste salud_agua,
+ *     ColorQ medido, estado_hidraulico y agua_llenado al
+ *     poolState.calculado. Dispara DIAGNOSTICO_ANCLADO al engine.
+ *     V17.2 sec 9.
+ *   - _actualizarSubselectoresTipo: muestra/oculta sub-selectores
+ *     condicionales (alga/metal/recubrimiento). Auto-expande
+ *     acordeón Salud del Agua si tipo ≠ rutina.
+ *   - _construirObjetoServicio: schema V17.2 sec 8 (contrato JSON).
+ *   - Listeners reactivos: cambio en salud/colorq/hidráulico
+ *     dispara override y preview. PSI llegada muestra hint inline.
+ *   - Funciones de fotos REMOVIDAS (migran a chat de Isaías).
+ *   - Cumple Reglas de Oro #6 (modo derivado), #7/#11
+ *     (salud_inicial inmutable), #10 (override no silencioso).
+ *
+ * V16.7.0 ADD VISTA PREVIA DE IMPACTO + VALIDACIÓN DE DOSIS MÁXIMA:
+ *   1. Cada fila de dosificación muestra una vista previa EN VIVO
+ *      del impacto químico, calculado vía Chemistry.calcDeltaPorAplicacion
+ *      con el gemelo activo. El preview se inserta dentro de la fila,
+ *      justo debajo de la cantidad, en un <div class="dosis-impacto">.
+ *   2. Listeners 'input'/'change' sobre producto y cantidad recalculan
+ *      el impacto con debounce de 250 ms para no saturar.
+ *   3. Validación de dosis máxima por delta:
+ *        ΔpH:   advertencia >0.5 / bloqueo >1.0
+ *        ΔALK:  advertencia >50 ppm / bloqueo >100 ppm
+ *        ΔCl:   advertencia >5 ppm / bloqueo >10 ppm
+ *        ΔCYA:  advertencia >10 ppm / bloqueo >25 ppm
+ *        ΔCH:   advertencia >100 ppm / bloqueo >200 ppm
+ *      (los umbrales miden valor absoluto, aplicables a alzas y bajas).
+ *      Bloqueo: deshabilita #btn-guardar-bitacora y marca la fila con
+ *      la clase .dosis-bloqueada.
+ *      Advertencia: banner ámbar en el preview, no bloquea guardado.
+ *   4. Se expone Bitacora.VERSION = '16.7.0'.
+ *   5. NO se modifica el flujo de guardado existente (el cálculo de
+ *      deltas finales sigue ocurriendo en _guardarBitacora con la misma
+ *      lógica V16.6.2).
+ *   Marcas: // V16.7.0 ADD  o  // V16.7.0 MOD.
+ *
+ * V16.7.0 INCORPORA MEJORAS DE GEMINI (Ítem 1, Ítem 11, Resumen WA):
+ *   - Selector dinámico de modo ácido (Bajar pH / Bajar Alcalinidad)
+ *     dentro de cada fila de dosificación para ácido muriático.
+ *   - Compresión de imágenes vía Canvas (max 1280px, JPEG Q=0.7)
+ *     para reducir el peso de las fotos en localStorage.
+ *   - Anotación del modo ácido en el resumen de WhatsApp.
+ *   Marcas: // V16.7.0 GEMINI-MOD
+ *
+ * V16.6.4 FIX ANCLA-PARCIAL: _anclarLecturaColorQ ahora distingue
+ * entre campos medidos por el usuario (sin clase colorq-prellenado)
+ * y campos pre-llenados por el motor. Solo envía como dato duro los
+ * primeros; los segundos se envían como null para que el Engine los
+ * conserve de la simulación actual. Esto permite anclar solo pH y
+ * Cloro sin destruir ALK, CH, CYA, TDS proyectados por el gemelo.
+ * Marcas: // V16.6.4 FIX ANCLA-PARCIAL.
+ *
+ * V16.6.3 FIX COLORQ-TOGGLE: se elimina el listener de bitacora.js
+ * sobre #btn-toggle-colorq para evitar el doble toggle que anulaba
+ * la acción. El index.html V16.6 (FIX 6) ya gestiona el toggle con
+ * pre-llenado desde el motor. La función _togglePanelColorQ se
+ * conserva para uso programático de otros módulos.
+ *
+ * V16.6.2 FIX BUG-DOSIS: el bloque que construye los deltas que se
+ * envían al Engine pasaba la CANTIDAD APLICADA como si fuera el
+ * DELTA DESEADO a Chemistry.calcDosificacion, invirtiendo el sentido
+ * del cálculo (ej. 500 g tricloro -> +500 ppm Cl libre). Se sustituye
+ * por Chemistry.calcDeltaPorAplicacion (V16.4.2 ADD), que recibe la
+ * cantidad física aplicada y devuelve el delta real. Ningún otro
+ * cambio en el archivo. Marcas: // V16.6.2 FIX BUG-DOSIS.
+ */
+
+(function () {
+  'use strict';
+
+  // ────────────────────────────────────────────────
+  //  CONSTANTES INTERNAS
+  // ────────────────────────────────────────────────
+
+  const FIRMA = 'Omar Alberto Valle Mercado | VAMO870509HW3';
+
+  // V17.2.4 MOD — Bump de versión.
+  const VERSION = '17.2.4';
+
+  // V17.2.0 MOD: 6 tipos de servicio nuevos. Reemplazan los
+  // comerciales antiguos (mantenimiento/limpieza/retrolavado/etc.)
+  // por modos operativos reales del agua.
+  const TIPOS_SERVICIO = Object.freeze([
+    { value: 'rutina',                label: 'Mantenimiento Rutinario' },
+    { value: 'algas',                 label: 'Sanitización / Choque por Algas' },
+    { value: 'balance_quimico',       label: 'Balance Químico' },
+    { value: 'correccion_sarro',      label: 'Corrección de Sarro' },
+    { value: 'recuperacion_metales',  label: 'Tratamiento de Metales' },
+    { value: 'post_choque_slam',      label: 'Recuperación Post-Choque' }
+  ]);
+
+  // V17.2.0 ADD: niveles de claridad oficiales V17.2 sec 5.1
+  const NIVELES_CLARIDAD = Object.freeze([
+    { value: 0, label: 'Cristalina',    ntu_aprox: '<0.5' },
+    { value: 1, label: 'Velada',        ntu_aprox: '0.5-5' },
+    { value: 2, label: 'Turbia',        ntu_aprox: '5-30' },
+    { value: 3, label: 'Verde Claro',   ntu_aprox: '30-100' },
+    { value: 4, label: 'Verde Oscuro',  ntu_aprox: '100-400' },
+    { value: 5, label: 'Pantano',       ntu_aprox: '>400' },
+    { value: 6, label: 'Blanca Lechosa', ntu_aprox: 'variable' }
+  ]);
+
+  // V17.2.0 ADD: tipos de alga V17.2 sec 5.3
+  const TIPOS_ALGA = Object.freeze([
+    'ninguna', 'verde', 'mostaza', 'negra', 'rosa', 'multiple', 'muriendo'
+  ]);
+
+  // V17.2.0 ADD: naturalezas del color V17.2 sec 5.2
+  const NATURALEZAS_COLOR = Object.freeze([
+    'ninguna', 'algas', 'metales', 'mixto'
+  ]);
+
+  // V17.2.0 ADD: tipos de olor V17.2 sec 5.3
+  const OLORES = Object.freeze([
+    'ninguno', 'cloro', 'cloramina', 'materia_organica', 'quimico', 'otro'
+  ]);
+
+  // V17.2.0 ADD: niveles de vaso V17.2 sec 7
+  const NIVELES_VASO = Object.freeze([
+    'normal', 'bajo', 'alto', 'desbordando'
+  ]);
+
+  // V17.2.0 ADD: fuentes de agua de llenado V17.2 sec 8
+  const FUENTES_AGUA = Object.freeze([
+    'red', 'pipa', 'pozo', 'otra'
+  ]);
+
+  // V17.2.0 REMOVED: UMBRALES_DOSIS estática. Los umbrales ahora se
+  // calculan dinámicamente vía _getUmbralesDosisActuales() según
+  // modo_operativo del gemelo y CYA actual.
+
+  // V16.7.0 ADD — Etiquetas legibles para el preview.
+  const ETIQUETAS_DELTA = {
+    deltaPH:  { label: 'ΔpH',  unidad: ''     },
+    deltaALK: { label: 'ΔALK', unidad: ' ppm' },
+    deltaCl:  { label: 'ΔCl libre',  unidad: ' ppm' },
+    deltaCYA: { label: 'ΔCYA', unidad: ' ppm' },
+    deltaCH:  { label: 'ΔCH',  unidad: ' ppm' }
+  };
+
+  // V16.7.0 (anterior) — Opciones de turbidez visual se mantienen para
+  // compatibilidad con bitácoras viejas, pero ya no son el selector principal.
+  const OPCIONES_TURBIDEZ = [
+    { value: 'cristalina', label: 'Cristalina' },
+    { value: 'clara', label: 'Clara' },
+    { value: 'ligeramente_turbia', label: 'Ligeramente turbia' },
+    { value: 'turbia', label: 'Turbia' },
+    { value: 'verde', label: 'Verde' },
+    { value: 'cafe', label: 'Café' }
+  ];
+
+  /** Categorías de productos para dosificación */
+  const CATEGORIAS_PRODUCTO = [
+    { value: 'desinfectante', label: 'Desinfectante' },
+    { value: 'abrillantador', label: 'Abrillantador/Clarificante' },
+    { value: 'alguicida', label: 'Alguicida' },
+    { value: 'ph_alcalinidad', label: 'pH / Alcalinidad' },
+    { value: 'otro', label: 'Otro' }
+  ];
+
+  /** Mapeo de productos por categoría para el selector dinámico */
+  const PRODUCTOS_POR_CATEGORIA = {
+    desinfectante: [
+      { clave: 'tricloro-polvo', nombre: 'Tricloro 90% (Granulado)', unidad: 'g' },
+      { clave: 'tricloro-tab3', nombre: 'Tricloro Tab 3" (200g)', unidad: 'tabs' },
+      { clave: 'tricloro-tab1', nombre: 'Tricloro Tab 1" (20g)', unidad: 'tabs' },
+      { clave: 'hipoclorito-calcio', nombre: 'Hipocalcio Klaren 65%', unidad: 'g' },
+      { clave: 'cloro-liquido', nombre: 'Cloro Líquido (NaClO 10%)', unidad: 'L' }
+    ],
+    abrillantador: [
+      { clave: 'gold-and-clear', nombre: 'Gold & Clear Klaren', unidad: 'mL' },
+      { clave: 'brilloquim', nombre: 'Brilloquim Novem', unidad: 'mL' }
+    ],
+    alguicida: [
+      { clave: 'algen-blue', nombre: 'Algen Blue Klaren', unidad: 'mL' },
+      { clave: 'algen-plus', nombre: 'Algen Plus Klaren', unidad: 'mL' }
+    ],
+    ph_alcalinidad: [
+      { clave: 'acido-muriatico', nombre: 'Ácido Muriático (HCl 31%)', unidad: 'mL' },
+      { clave: 'ph-menos', nombre: 'pH Menos Klaren (Bisulfato de Sodio)', unidad: 'g' },
+      { clave: 'alcalos', nombre: 'Alcalos Spin (Na₂CO₃)', unidad: 'g' },
+      { clave: 'alkalin', nombre: 'Alkalin Spin (NaHCO₃)', unidad: 'g' },
+      { clave: 'acido-cianurico', nombre: 'Ácido Cianúrico', unidad: 'g' },
+      { clave: 'cloruro-calcio', nombre: 'Cloruro de Calcio', unidad: 'g' },
+      { clave: 'magnesio', nombre: 'Amortiguador de Magnesio', unidad: 'g' },
+      { clave: 'secuestrante', nombre: 'Secuestrante de Metales', unidad: 'mL' }
+    ],
+    otro: [
+      { clave: 'otro', nombre: 'Otro (especificar en notas)', unidad: 'g' }
+    ]
+  };
+
+  // ────────────────────────────────────────────────
+  //  ESTADO INTERNO PRIVADO
+  // ────────────────────────────────────────────────
+
+  /** @type {string|null} ID de la alberca activa */
+  let _albercaActivaId = null;
+
+  /** @type {Object|null} Expediente del Gemelo Digital activo */
+  let _gemeloActivo = null;
+
+  /** @type {boolean} Cronómetro de retrolavado activo */
+  let _cronometroRetroActivo = false;
+
+  /** @type {number|null} Interval ID del cronómetro de retrolavado */
+  let _cronometroRetroInterval = null;
+
+  /** @type {number} Segundos acumulados del cronómetro de retrolavado */
+  let _cronometroRetroSegundos = 0;
+
+  /** @type {boolean} Cronómetro de llenado activo */
+  let _cronometroLlenadoActivo = false;
+
+  /** @type {number|null} Interval ID del cronómetro de llenado */
+  let _cronometroLlenadoInterval = null;
+
+  /** @type {number} Segundos acumulados del cronómetro de llenado */
+  let _cronometroLlenadoSegundos = 0;
+
+  // V17.2.0 REMOVED: _fotosAntes y _fotosDespues. Las fotos migran al chat
+  // de Isaías como adjunto separado (sala futura). La bitácora ya no maneja
+  // imágenes.
+
+  /** @type {number} Contador para IDs únicos de filas de dosificación */
+  let _dosificacionRowCounter = 0;
+
+  /** @type {boolean} Flag para doble clic en detener retrolavado */
+  let _retroDetenerPrimerClic = false;
+
+  /** @type {number|null} Timeout para resetear el doble clic */
+  let _retroDetenerTimeout = null;
+
+  /** @type {boolean} Flag para doble clic en detener llenado */
+  let _llenadoDetenerPrimerClic = false;
+
+  /** @type {number|null} */
+  let _llenadoDetenerTimeout = null;
+
+  // V16.7.0 ADD — Mapa de timeouts de debounce por fila para el preview de impacto.
+  // Clave: ID de la fila ('dosis-row-N'); Valor: timeout activo.
+  const _previewDebounce = new Map();
+
+  // ────────────────────────────────────────────────
+  //  UTILIDADES DOM INTERNAS
+  // ────────────────────────────────────────────────
+
+  /**
+   * Obtiene un elemento del DOM por ID, con manejo de null.
+   * @param {string} id - ID del elemento.
+   * @returns {HTMLElement|null}
+   * @private
+   */
+  function $(id) {
+    return document.getElementById(id);
+  }
+
+  /**
+   * Obtiene el valor de un input numérico.
+   * @param {string} id - ID del input.
+   * @param {number} [fallback=0] - Valor por defecto.
+   * @returns {number}
+   * @private
+   */
+  function _numVal(id, fallback = 0) {
+    const el = $(id);
+    if (!el) return fallback;
+    const v = parseFloat(el.value);
+    return isNaN(v) ? fallback : v;
+  }
+
+  /**
+   * Obtiene el valor string de un input/select.
+   * @param {string} id - ID del elemento.
+   * @param {string} [fallback=''] - Valor por defecto.
+   * @returns {string}
+   * @private
+   */
+  function _strVal(id, fallback = '') {
+    const el = $(id);
+    return el ? (el.value || fallback) : fallback;
+  }
+
+  /**
+   * Obtiene el estado checked de un checkbox.
+   * @param {string} id - ID del checkbox.
+   * @returns {boolean}
+   * @private
+   */
+  function _checked(id) {
+    const el = $(id);
+    return el ? el.checked : false;
+  }
+
+  /**
+   * Formatea segundos a MM:SS.
+   * @param {number} totalSeg - Total de segundos.
+   * @returns {string} Formato "MM:SS".
+   * @private
+   */
+  function _formatCrono(totalSeg) {
+    const min = Math.floor(totalSeg / 60);
+    const seg = totalSeg % 60;
+    return `${String(min).padStart(2, '0')}:${String(seg).padStart(2, '0')}`;
+  }
+
+  /**
+   * Muestra un toast de notificación en pantalla.
+   * @param {string} mensaje - Texto del toast.
+   * @param {string} [tipo='success'] - 'success', 'error', 'warning', 'info'.
+   * @param {number} [duracion=3000] - Milisegundos de duración.
+   * @private
+   */
+  function _toast(mensaje, tipo = 'success', duracion = 3000) {
+    let container = $('toast-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'toast-container';
+      container.style.cssText =
+        'position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;';
+      document.body.appendChild(container);
+    }
+
+    const colores = {
+      success: '#2da44e',
+      error: '#dc2626',
+      warning: '#f59e0b',
+      info: '#3b82f6'
+    };
+
+    const emojis = {
+      success: '✅',
+      error: '❌',
+      warning: '⚠️',
+      info: 'ℹ️'
+    };
+
+    const toast = document.createElement('div');
+    toast.style.cssText =
+      `background:${colores[tipo] || colores.info};color:#fff;padding:12px 20px;` +
+      'border-radius:8px;font-size:0.85rem;font-weight:500;box-shadow:0 4px 12px rgba(0,0,0,0.3);' +
+      'opacity:0;transform:translateX(100%);transition:all 0.3s ease;max-width:320px;';
+    toast.textContent = `${emojis[tipo] || ''} ${mensaje}`;
+
+    container.appendChild(toast);
+
+    requestAnimationFrame(() => {
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateX(0)';
+    });
+
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateX(100%)';
+      setTimeout(() => toast.remove(), 350);
+    }, duracion);
+  }
+
+  /**
+   * Genera un timestamp ISO local legible.
+   * @returns {string}
+   * @private
+   */
+  function _nowISO() {
+    return new Date().toISOString();
+  }
+
+  /**
+   * Genera un formato de fecha para el campo datetime-local.
+   * @returns {string} YYYY-MM-DDTHH:MM
+   * @private
+   */
+  function _nowDatetimeLocal() {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+           `T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  }
+
+  // ────────────────────────────────────────────────
+  //  V17.2.0 ADD — UMBRALES DINÁMICOS POR MODO
+  // ────────────────────────────────────────────────
+
+  /**
+   * V17.2.0 ADD: umbrales de dosis dinámicos por modo_operativo
+   * Resuelve E2 (Bitácora bloquea supercloraciones de choque).
+   * @param {Object} poolState - Objeto con { calculado: { cianurico, modo_operativo } }
+   * @returns {Object} Umbrales por parámetro.
+   * @private
+   */
+  function _getUmbralesDosisActuales(poolState) {
+    const cya = (poolState && poolState.calculado && poolState.calculado.cianurico)
+                ? parseFloat(poolState.calculado.cianurico) : 0;
+    const modo = (poolState && poolState.calculado && poolState.calculado.modo_operativo)
+                 ? poolState.calculado.modo_operativo : 'rutinario';
+
+    const umbCl = (window.Chemistry && Chemistry.getUmbralesClorOperativos)
+                  ? Chemistry.getUmbralesClorOperativos(cya)
+                  : { cl_alto: 5, cl_toxico: 10, cl_superchoque: 20 };
+
+    let deltaClBlock;
+    let deltaClWarn;
+    switch (modo) {
+      case 'rutinario':
+      case 'recuperacion_leve':
+        deltaClWarn  = umbCl.cl_alto;
+        deltaClBlock = umbCl.cl_toxico;
+        break;
+      case 'recuperacion_severa':
+        deltaClWarn  = umbCl.cl_toxico;
+        deltaClBlock = umbCl.cl_superchoque;
+        break;
+      case 'rescate':
+      case 'post_choque':
+        deltaClWarn  = umbCl.cl_superchoque;
+        deltaClBlock = umbCl.cl_superchoque * 1.5;
+        break;
+      case 'metales':
+        // V17.2.0: HARD-STOP. Cualquier cloración positiva es BLOCK.
+        deltaClWarn  = 0.01;
+        deltaClBlock = 0.01;
+        break;
+      case 'sarro_controlado':
+      case 'balance':
+      default:
+        deltaClWarn  = umbCl.cl_alto;
+        deltaClBlock = umbCl.cl_toxico;
+    }
+
+    return {
+      modo: modo,
+      cya: cya,
+      deltaCl:  { warn: deltaClWarn, block: deltaClBlock },
+      deltaPh:  { warn: 0.5,  block: 1.0  },
+      deltaAlk: { warn: 40,   block: 80   },
+      deltaCh:  { warn: 100,  block: 200  },
+      deltaCya: { warn: 30,   block: 60   }
+    };
+  }
+
+  // ────────────────────────────────────────────────
+  //  V16.7.0 ADD — VISTA PREVIA DE IMPACTO QUÍMICO
+  // ────────────────────────────────────────────────
+
+  /**
+   * V16.7.0 ADD — Construye el contexto del gemelo (lecturas actuales)
+   * para alimentar a Chemistry.calcDeltaPorAplicacion.
+   * @returns {Object}
+   * @private
+   */
+  function _construirContextoGemeloVivo() {
+    const pzq = (_gemeloActivo && _gemeloActivo.punto_cero_quimico) || {};
+    const geo = (_gemeloActivo && _gemeloActivo.geometria_adn) || {};
+    const recubrimientoCtx = (geo.recubrimiento && geo.recubrimiento.tipo)
+      ? String(geo.recubrimiento.tipo).toLowerCase()
+      : 'porcelanato';
+
+    return {
+      ph:            _numVal('bit-ph', 0)          || pzq.ph                || 7.4,
+      alcalinidad:   _numVal('bit-alcalinidad', 0) || pzq.alcalinidad       || 100,
+      temperatura:   _numVal('bit-temperatura', 0) || pzq.temperatura_llenado || 28,
+      dureza:        _numVal('bit-dureza', 0)      || pzq.dureza            || 250,
+      cianurico:     _numVal('bit-cianurico', 0)   || pzq.cianurico         || 30,
+      tds:           _numVal('bit-tds', 0)         || 0,
+      recubrimiento: recubrimientoCtx
+    };
+  }
+
+  // V17.2.4 ADD FIX DELTA-PH-RESCATE
+  /**
+   * Decide si una dosificación de ácido o cloro ácido debe usar el
+   * solver termodinámico del Entregable F en lugar de la heurística CPO.
+   * @param {string} claveProducto
+   * @param {string} modoOperativo
+   * @param {number} alkActual - alcalinidad en ppm
+   * @returns {boolean}
+   * @private
+   */
+  function _debeUsarEntregableF(claveProducto, modoOperativo, alkActual) {
+    const productosAplicables = new Set([
+      'acido-muriatico', 'acido',
+      'tricloro-polvo', 'tricloro-tab3', 'tricloro-tab1',
+      'ph-menos'
+    ]);
+    if (!productosAplicables.has(claveProducto)) return false;
+
+    if (modoOperativo === 'rescate' ||
+        modoOperativo === 'recuperacion_severa' ||
+        modoOperativo === 'post_choque') return true;
+
+    if (typeof alkActual === 'number' && !isNaN(alkActual) && alkActual < 80) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Convierte cantidad+unidad a gramos de producto comercial para
+   * alimentar a Chemistry.calcDeltaPhPorDosificacion.
+   * Densidad HCl 31 %: 1.16 g/mL.
+   * @param {string} clave
+   * @param {number} cantidad
+   * @param {string} unidad - 'g', 'ml', 'l', 'kg', 'tabs'
+   * @returns {number} gramos
+   * @private
+   */
+  function _convertirAGramos(clave, cantidad, unidad) {
+    const u = (unidad || '').toLowerCase();
+    if (clave === 'acido-muriatico' || clave === 'acido') {
+      if (u === 'ml') return cantidad * 1.16;
+      if (u === 'l')  return cantidad * 1160;
+      return cantidad;
+    }
+    if (clave === 'tricloro-tab3') return cantidad * 200;
+    if (clave === 'tricloro-tab1') return cantidad * 20;
+    if (u === 'kg') return cantidad * 1000;
+    if (u === 'l')  return cantidad * 1000;
+    return cantidad;
+  }
+
+  /**
+   * Wrapper que decide qué motor usar y devuelve el objeto de deltas
+   * en el mismo formato que Chemistry.calcDeltaPorAplicacion.
+   * @returns {Object|null}
+   * @private
+   */
+  function _calcularDeltasInteligente(clave, cantidad, unidad, volM3, ctx, modoOperativo) {
+    const alkActual = ctx && typeof ctx.alcalinidad === 'number' ? ctx.alcalinidad : null;
+
+    if (_debeUsarEntregableF(clave, modoOperativo, alkActual) &&
+        window.Chemistry &&
+        typeof window.Chemistry.calcDeltaPhPorDosificacion === 'function') {
+
+      try {
+        const gramos = _convertirAGramos(clave, cantidad, unidad);
+        const resF = window.Chemistry.calcDeltaPhPorDosificacion(
+          clave, gramos, volM3, ctx
+        );
+
+        if (!resF || !resF.base) {
+          console.warn('[Bitácora V17.2.4] Entregable F no devolvió escenario base, fallback a heurística.');
+        } else {
+          const base = resF.base;
+          // Complementar con deltas de Cl/CYA/CH desde la heurística original
+          let resHeur = null;
+          try {
+            resHeur = window.Chemistry.calcDeltaPorAplicacion(clave, cantidad, unidad, volM3, ctx);
+          } catch (e) { /* ignorar */ }
+
+          return {
+            deltaPH:  base.deltaPH  != null ? base.deltaPH  : (resHeur ? resHeur.deltaPH  : 0),
+            deltaALK: base.deltaALK != null ? base.deltaALK : (resHeur ? resHeur.deltaALK : 0),
+            deltaCl:  resHeur && resHeur.deltaCl  != null ? resHeur.deltaCl  : 0,
+            deltaCYA: resHeur && resHeur.deltaCYA != null ? resHeur.deltaCYA : 0,
+            deltaCH:  resHeur && resHeur.deltaCH  != null ? resHeur.deltaCH  : 0,
+            _motor_usado: 'entregable_f',
+            _escenarios: resF
+          };
+        }
+      } catch (e) {
+        console.warn('[Bitácora V17.2.4] Error en Entregable F, fallback a heurística:', e);
+      }
+    }
+
+    // Fallback: heurística CPO original
+    if (window.Chemistry && typeof window.Chemistry.calcDeltaPorAplicacion === 'function') {
+      const r = window.Chemistry.calcDeltaPorAplicacion(clave, cantidad, unidad, volM3, ctx);
+      if (r) r._motor_usado = 'heuristica_cpo';
+      return r;
+    }
+    return null;
+  }
+  // V17.2.4 END FIX DELTA-PH-RESCATE
+   * contra los umbrales proporcionados.
+   * @param {Object} deltas
+   * @param {Object} umbrales
+   * @returns {{ nivel: 'ok'|'warn'|'block', detalles: Array }}
+   * @private
+   */
+  function _evaluarSeveridad(deltas, umbrales) {
+    if (!umbrales) { return { nivel: 'ok', detalles: [] }; }
+    let nivelGlobal = 'ok';
+    const detalles = [];
+
+    const mapping = {
+      deltaPH:  umbrales.deltaPh,
+      deltaALK: umbrales.deltaAlk,
+      deltaCl:  umbrales.deltaCl,
+      deltaCYA: umbrales.deltaCya,
+      deltaCH:  umbrales.deltaCh
+    };
+
+    Object.keys(mapping).forEach((k) => {
+      const v = deltas[k];
+      if (v == null || isNaN(v)) return;
+      const abs = Math.abs(v);
+      const u = mapping[k];
+      let nivel = 'ok';
+      if (abs > u.block) nivel = 'block';
+      else if (abs > u.warn) nivel = 'warn';
+
+      detalles.push({ key: k, valor: v, nivel });
+
+      if (nivel === 'block') nivelGlobal = 'block';
+      else if (nivel === 'warn' && nivelGlobal !== 'block') nivelGlobal = 'warn';
+    });
+
+    return { nivel: nivelGlobal, detalles };
+  }
+
+  /**
+   * V16.7.0 ADD — Renderiza el preview de impacto dentro de la fila.
+   * V17.2.2 FIX BUG-002: lee poolState real de DB.
+   * @param {HTMLElement} fila
+   * @param {Object|null} resultado
+   * @param {string} [mensajeInfo]
+   * @private
+   */
+  function _renderPreviewImpacto(fila, resultado, mensajeInfo) {
+    if (!fila) return;
+
+    let preview = fila.querySelector('.dosis-impacto');
+    if (!preview) {
+      preview = document.createElement('div');
+      preview.className = 'dosis-impacto';
+      preview.style.cssText =
+        'flex-basis:100%;width:100%;margin-top:6px;padding:8px 10px;border-radius:6px;' +
+        'font-size:0.78rem;line-height:1.4;background:rgba(59,130,246,0.08);' +
+        'color:#1e3a8a;border:1px solid rgba(59,130,246,0.25);';
+      fila.appendChild(preview);
+    }
+
+    // V17.2.2 FIX BUG-002: leer poolState real de DB en lugar de hardcodear 'rutinario'
+    let umbralesDinamicos = null;
+    if (resultado) {
+      let poolStateReal = null;
+      try {
+        if (window.DB && typeof DB.getPoolState === 'function') {
+          poolStateReal = DB.getPoolState(_albercaActivaId);
+        }
+      } catch (e) {
+        console.warn('[Bitacora._renderPreviewImpacto] No se pudo leer poolState:', e);
+      }
+
+      const ctx = _construirContextoGemeloVivo();
+      const effectivePoolState = poolStateReal || {
+        calculado: {
+          cianurico: ctx.cianurico,
+          modo_operativo: 'rutinario'
+        }
+      };
+      umbralesDinamicos = _getUmbralesDosisActuales(effectivePoolState);
+    }
+
+    if (!resultado) {
+      preview.style.background = 'rgba(0,0,0,0.04)';
+      preview.style.color = '#555';
+      preview.style.border = '1px dashed rgba(0,0,0,0.15)';
+      preview.innerHTML = `<em>${mensajeInfo || 'Ingresa producto y cantidad para ver el impacto químico estimado.'}</em>`;
+      fila.classList.remove('dosis-bloqueada');
+      _actualizarEstadoGuardado();
+      return;
+    }
+
+    const partes = [];
+    Object.keys(ETIQUETAS_DELTA).forEach((k) => {
+      const v = resultado[k];
+      if (v == null || isNaN(v) || Math.abs(v) < 0.001) return;
+      const meta = ETIQUETAS_DELTA[k];
+      const signo = v > 0 ? '+' : '';
+      const dec = (k === 'deltaPH') ? 2 : 1;
+      partes.push(`<strong>${meta.label}</strong> ${signo}${v.toFixed(dec)}${meta.unidad}`);
+    });
+
+    const sev = _evaluarSeveridad(resultado, umbralesDinamicos);
+
+    if (sev.nivel === 'block') {
+      preview.style.background = '#fee2e2';
+      preview.style.color = '#7f1d1d';
+      preview.style.border = '1px solid #ef4444';
+      fila.classList.add('dosis-bloqueada');
+    } else if (sev.nivel === 'warn') {
+      preview.style.background = '#fef3c7';
+      preview.style.color = '#78350f';
+      preview.style.border = '1px solid #f59e0b';
+      fila.classList.remove('dosis-bloqueada');
+    } else {
+      preview.style.background = 'rgba(45,164,78,0.10)';
+      preview.style.color = '#14532d';
+      preview.style.border = '1px solid rgba(45,164,78,0.35)';
+      fila.classList.remove('dosis-bloqueada');
+    }
+
+    let header = '';
+    if (sev.nivel === 'block') {
+      header = '🚫 <strong>Dosis fuera de rango seguro.</strong> Reduce la cantidad antes de guardar.';
+    } else if (sev.nivel === 'warn') {
+      header = '⚠️ <strong>Dosis alta.</strong> Verifica que sea correcta.';
+    } else {
+      header = '✅ Impacto químico estimado:';
+    }
+
+    preview.innerHTML = `
+      <div style="margin-bottom:4px">${header}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px 14px">
+        ${partes.length > 0 ? partes.join(' · ') : '<em>Sin impacto significativo</em>'}
+      </div>
+    `;
+
+    _actualizarEstadoGuardado();
+  }
+
+  /**
+   * V16.7.0 ADD — Calcula el preview de impacto para una fila concreta.
+   * V16.7.0 GEMINI-MOD — Inyecta modo_acido al contexto si aplica.
+   * @param {HTMLElement} fila
+   * @private
+   */
+  function _calcularImpactoFila(fila) {
+    if (!fila) return;
+
+    const selProd  = fila.querySelector('.dosis-producto');
+    const inputCant = fila.querySelector('.dosis-cantidad');
+    const spanUnid  = fila.querySelector('.dosis-unidad');
+
+    if (!selProd || !inputCant) return;
+
+    const clave = selProd.value;
+    const cantidad = parseFloat(inputCant.value);
+    const unidad = (spanUnid?.textContent || '').toLowerCase();
+
+    if (!_albercaActivaId || !_gemeloActivo) {
+      _renderPreviewImpacto(fila, null, 'Selecciona una alberca para ver el impacto químico.');
+      return;
+    }
+    if (!clave) {
+      _renderPreviewImpacto(fila, null, 'Selecciona un producto.');
+      return;
+    }
+    if (!cantidad || cantidad <= 0) {
+      _renderPreviewImpacto(fila, null, 'Ingresa la cantidad para estimar el impacto.');
+      return;
+    }
+    if (!window.Chemistry || typeof window.Chemistry.calcDeltaPorAplicacion !== 'function') {
+      _renderPreviewImpacto(fila, null, 'Chemistry.calcDeltaPorAplicacion no disponible (requiere V16.4.2+).');
+      return;
+    }
+
+    const volM3 = parseFloat(_gemeloActivo.geometria_adn?.volumen_m3) || 0;
+    if (volM3 <= 0) {
+      _renderPreviewImpacto(fila, null, 'Volumen de la alberca no definido en el expediente.');
+      return;
+    }
+
+    const ctx = _construirContextoGemeloVivo();
+
+    // V16.7.0 GEMINI-MOD — Inyección de modo_acido
+    if (clave === 'acido-muriatico' || clave === 'acido') {
+      const radio = fila.querySelector(`input[name="modo_acido_${fila.id}"]:checked`);
+      if (radio) ctx.modo_acido = radio.value;
+    }
+
+    try {
+      // V17.2.4 MOD FIX DELTA-PH-RESCATE: detectar modo y usar Entregable F si aplica
+      let modoOp = 'rutinario';
+      try {
+        if (window.DB && typeof DB.getPoolState === 'function' && _albercaActivaId) {
+          const ps = DB.getPoolState(_albercaActivaId);
+          if (ps && ps.calculado && ps.calculado.modo_operativo) {
+            modoOp = ps.calculado.modo_operativo;
+          }
+        }
+      } catch (e) { /* silenciar */ }
+
+      const res = _calcularDeltasInteligente(clave, cantidad, unidad, volM3, ctx, modoOp);
+      if (!res) {
+        _renderPreviewImpacto(fila, null, 'No se pudo calcular el impacto para este producto.');
+        return;
+      }
+      _renderPreviewImpacto(fila, res);
+      // V17.2.4 END MOD
+    } catch (e) {
+      console.warn('[Bitácora] Error en preview de impacto:', e);
+      _renderPreviewImpacto(fila, null, 'Error al calcular el impacto: ' + e.message);
+    }
+  }
+
+  /**
+   * V16.7.0 ADD — Programa el cálculo del preview con debounce de 250 ms.
+   * @param {HTMLElement} fila
+   * @private
+   */
+  function _programarPreviewFila(fila) {
+    if (!fila || !fila.id) return;
+
+    const prev = _previewDebounce.get(fila.id);
+    if (prev) clearTimeout(prev);
+
+    const t = setTimeout(() => {
+      _previewDebounce.delete(fila.id);
+      _calcularImpactoFila(fila);
+    }, 250);
+
+    _previewDebounce.set(fila.id, t);
+  }
+
+  /**
+   * V16.7.0 ADD — Recalcula el preview de TODAS las filas activas.
+   * @private
+   */
+  function _recalcularTodosLosPreviews() {
+    const container = $('dosificacion-container');
+    if (!container) return;
+    const filas = container.querySelectorAll('.dosis-row');
+    filas.forEach((fila) => _programarPreviewFila(fila));
+  }
+
+  /**
+   * V16.7.0 ADD — Actualiza el estado del botón "Guardar bitácora".
+   * @private
+   */
+  function _actualizarEstadoGuardado() {
+    const btn = $('btn-guardar-bitacora');
+    if (!btn) return;
+
+    const container = $('dosificacion-container');
+    const bloqueadas = container ? container.querySelectorAll('.dosis-row.dosis-bloqueada').length : 0;
+
+    if (bloqueadas > 0) {
+      btn.disabled = true;
+      btn.title = `${bloqueadas} dosis fuera de rango seguro. Ajusta antes de guardar.`;
+      btn.style.opacity = '0.55';
+      btn.style.cursor = 'not-allowed';
+    } else {
+      btn.disabled = false;
+      btn.title = '';
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+    }
+  }
+
+  // ────────────────────────────────────────────────
+  //  V17.2.0 ADD — BANNER ÁMBAR DE OVERRIDE
+  // ────────────────────────────────────────────────
+
+  /**
+   * V17.2.0 ADD: evaluación de override bidireccional (V17.2 sec 5.1).
+   * @private
+   */
+  function _evaluarOverrideTipoServicio() {
+    const tipoServicio = document.getElementById('bit-tipo')
+                         ? document.getElementById('bit-tipo').value : '';
+    const claridad = document.getElementById('bit-claridad')
+                     ? parseInt(document.getElementById('bit-claridad').value, 10) : NaN;
+    const naturalezaColor = (document.querySelector('input[name="bit-naturaleza-color"]:checked'))
+                            ? document.querySelector('input[name="bit-naturaleza-color"]:checked').value : 'ninguna';
+    const tipoAlga = document.getElementById('bit-tipo-alga-presunta')
+                     ? document.getElementById('bit-tipo-alga-presunta').value : 'ninguna';
+
+    const banner = document.getElementById('bit-banner-override');
+    if (!banner) return;
+
+    let inconsistencia = null;
+
+    if (tipoServicio === 'rutina') {
+      if (!isNaN(claridad) && claridad >= 3) {
+        inconsistencia = {
+          tipo: 'escalacion',
+          mensaje: 'Detectaste claridad nivel ' + claridad +
+                   ' (' + (NIVELES_CLARIDAD[claridad] ? NIVELES_CLARIDAD[claridad].label : '') + ').' +
+                   ' El tipo de servicio actual es Mantenimiento de Rutina.',
+          accion_principal: 'algas',
+          texto_accion: 'Cambiar a Tratamiento por Algas'
+        };
+      } else if (tipoAlga !== 'ninguna' && tipoAlga !== 'muriendo') {
+        inconsistencia = {
+          tipo: 'escalacion',
+          mensaje: 'Detectaste alga ' + tipoAlga + '. El tipo de servicio actual es Mantenimiento de Rutina.',
+          accion_principal: 'algas',
+          texto_accion: 'Cambiar a Tratamiento por Algas'
+        };
+      } else if (naturalezaColor === 'metales') {
+        inconsistencia = {
+          tipo: 'escalacion',
+          mensaje: 'Detectaste naturaleza del color = METALES. El tipo de servicio actual es Mantenimiento de Rutina.',
+          accion_principal: 'recuperacion_metales',
+          texto_accion: 'Cambiar a Tratamiento de Metales'
+        };
+      }
+    }
+
+    if (tipoServicio === 'algas' && !isNaN(claridad) && claridad === 0 &&
+        (tipoAlga === 'ninguna' || tipoAlga === 'muriendo') &&
+        naturalezaColor === 'ninguna') {
+      inconsistencia = {
+        tipo: 'descalacion',
+        mensaje: 'Tipo de servicio = Tratamiento por Algas, pero el agua está cristalina sin algas visibles.',
+        accion_principal: 'rutina',
+        texto_accion: 'Cambiar a Mantenimiento Rutinario'
+      };
+    }
+
+    if (!inconsistencia) {
+      banner.style.display = 'none';
+      banner.innerHTML = '';
+      return;
+    }
+
+    banner.style.display = 'block';
+    banner.innerHTML =
+      '<div style="background:#fef3c7; border:2px solid #f59e0b;' +
+      ' border-radius:8px; padding:12px; margin:12px 0; color:#78350f;">' +
+        '<strong>⚠️ Inconsistencia detectada</strong><br>' +
+        inconsistencia.mensaje + '<br><br>' +
+        '<button type="button" id="bit-override-aceptar"' +
+        ' style="background:#f59e0b; color:white; padding:8px 14px;' +
+        ' border:none; border-radius:6px; font-weight:bold; margin-right:8px; cursor:pointer;">' +
+        inconsistencia.texto_accion + '</button>' +
+        '<button type="button" id="bit-override-mantener"' +
+        ' style="background:white; color:#78350f; padding:8px 14px;' +
+        ' border:1px solid #f59e0b; border-radius:6px; cursor:pointer;">' +
+        'Mantener mi selección' + '</button>' +
+      '</div>';
+
+    document.getElementById('bit-override-aceptar').onclick = function() {
+      const sel = document.getElementById('bit-tipo');
+      if (sel) sel.value = inconsistencia.accion_principal;
+      banner.style.display = 'none';
+      banner.innerHTML = '';
+      sel.dispatchEvent(new Event('change'));
+    };
+    document.getElementById('bit-override-mantener').onclick = function() {
+      banner.style.display = 'none';
+      banner.innerHTML = '';
+    };
+  }
+
+  // ────────────────────────────────────────────────
+  //  V17.2.1 FIX / V17.2.3 FIX BUG-007 — ANCLA DE DIAGNÓSTICO
+  // ────────────────────────────────────────────────
+
+  /**
+   * V17.2.0 ADD: ancla diagnóstico V17.2 sec 9.
+   * V17.2.1 FIX: elimina llamada duplicada a Engine.recalcularTrasEvento.
+   * V17.2.3 FIX BUG-007: emite 'bitacora:diagnostico_anclado' con payload
+   *   completo (poolId, parametros, salud) y fuerza
+   *   Engine.proyectarEstadoActual(poolId) tras el dispatch.
+   * @private
+   */
+  function _anclarDiagnostico() {
+    const poolId = _albercaActivaId;
+    if (!poolId) {
+      _toast('⚠️ Selecciona una alberca primero.', 'warn');
+      return;
+    }
+
+    // 1. Recoger Bloque 3 — Salud del Agua
+    const claridad = document.getElementById('bit-claridad')
+                     ? parseInt(document.getElementById('bit-claridad').value, 10) : null;
+    const naturalezaColor = (document.querySelector('input[name="bit-naturaleza-color"]:checked'))
+                            ? document.querySelector('input[name="bit-naturaleza-color"]:checked').value : 'ninguna';
+
+    // tipo_alga: si el campo #bit-tipo-alga-presunta no está visible, usar 'ninguna'
+    const elTipoAlga = document.getElementById('bit-tipo-alga-presunta');
+    const tipoAlgaVisible = elTipoAlga && elTipoAlga.closest('[style*="display: none"]') === null
+                            && elTipoAlga.closest('[style*="display:none"]') === null;
+    const tipoAlga = (elTipoAlga && tipoAlgaVisible) ? (elTipoAlga.value || 'ninguna') : 'ninguna';
+
+    const visibilidadFondo = document.getElementById('bit-visibilidad-fondo')
+                             ? parseFloat(document.getElementById('bit-visibilidad-fondo').value) : null;
+    const profundidadVisible = document.getElementById('bit-profundidad-visible')
+                               ? parseFloat(document.getElementById('bit-profundidad-visible').value) : null;
+    const olor = document.getElementById('bit-olor')
+                 ? document.getElementById('bit-olor').value : 'ninguno';
+
+    const saludAgua = {
+      claridad_actual: claridad,
+      naturaleza_color: naturalezaColor,
+      tipo_alga: tipoAlga,
+      visibilidad_fondo_m: isNaN(visibilidadFondo) ? null : visibilidadFondo,
+      profundidad_visible_m: isNaN(profundidadVisible) ? null : profundidadVisible,
+      olor: olor,
+      fecha_lectura: new Date().toISOString()
+    };
+
+    // 2. Recoger Bloque 4 — ColorQ medido
+    const camposColorQ = ['ph','temperatura','cloro_libre','cloro_total',
+                          'alcalinidad','dureza_calcica','cianurico','tds'];
+    const lecturaColorQ = {};
+    const camposMedidos = [];
+
+    camposColorQ.forEach(function(campo) {
+      const id = 'bit-colorq-' + campo;
+      const input = document.getElementById(id);
+      if (!input) return;
+      const valor = parseFloat(input.value);
+      if (input.classList.contains('colorq-prellenado')) {
+        lecturaColorQ[campo] = isNaN(valor) ? null : valor;
+      } else {
+        lecturaColorQ[campo] = isNaN(valor) ? null : valor;
+        if (!isNaN(valor)) camposMedidos.push(campo);
+      }
+    });
+    lecturaColorQ.campos_medidos = camposMedidos;
+
+    // 3. Recoger Bloque 5 — Estado Hidráulico
+    const estadoHidraulico = {
+      psi_llegada: document.getElementById('bit-psi-llegada')
+                   ? (parseFloat(document.getElementById('bit-psi-llegada').value) || null)
+                   : null,
+      nivel_vaso: document.getElementById('bit-nivel-vaso')
+                  ? document.getElementById('bit-nivel-vaso').value : 'normal',
+      observacion_bomba: document.getElementById('bit-obs-bomba')
+                         ? document.getElementById('bit-obs-bomba').value : '',
+      observacion_filtro: document.getElementById('bit-obs-filtro')
+                          ? document.getElementById('bit-obs-filtro').value : ''
+    };
+
+    // 4. Recoger Bloque 6 — Agua de Llenado (opcional)
+    let aguaLlenado = null;
+    const fuente = document.getElementById('bit-fuente-agua');
+    if (fuente && fuente.value) {
+      aguaLlenado = {
+        fuente: fuente.value,
+        ph: parseFloat(document.getElementById('bit-llenado-ph')?.value) || null,
+        alcalinidad: parseFloat(document.getElementById('bit-llenado-alk')?.value) || null,
+        dureza: parseFloat(document.getElementById('bit-llenado-dureza')?.value) || null,
+        cianurico: parseFloat(document.getElementById('bit-llenado-cya')?.value) || null,
+        tds: parseFloat(document.getElementById('bit-llenado-tds')?.value) || null,
+        temperatura: parseFloat(document.getElementById('bit-llenado-temp')?.value) || null
+      };
+    }
+
+    // 5. Recoger tipo_servicio
+    const tipoServicio = document.getElementById('bit-tipo')
+                         ? document.getElementById('bit-tipo').value : '';
+
+    // 6. Persistir parámetros medidos vía DB.saveRegistro
+    if (camposMedidos.length > 0 && window.DB && DB.saveRegistro) {
+      const parametrosMedidos = {};
+      camposMedidos.forEach(function(c) { parametrosMedidos[c] = lecturaColorQ[c]; });
+      try { DB.saveRegistro(poolId, parametrosMedidos); }
+      catch (e) { console.warn('[Bitacora._anclarDiagnostico] Error en saveRegistro:', e); }
+    }
+
+    // ── V17.2.3 FIX BUG-007: construir parametros (solo campos con valor no vacío) ──
+    const parametrosAncla = {};
+    const camposParam = ['ph', 'cloro_libre', 'alcalinidad', 'dureza_calcica',
+                         'cianurico', 'tds', 'temperatura'];
+    camposParam.forEach(function(campo) {
+      const idBit = 'bit-' + (campo === 'dureza_calcica' ? 'dureza'
+                             : campo === 'cloro_libre'    ? 'cloro-libre'
+                             : campo);
+      const el = document.getElementById(idBit);
+      if (!el) return;
+      const v = parseFloat(el.value);
+      if (!isNaN(v) && el.value.trim() !== '') parametrosAncla[campo] = v;
+    });
+
+    // 7. Disparar evento 'bitacora:diagnostico_anclado' — V17.2.3 FIX BUG-007
+    //    Payload completo con poolId, parametros y salud.
+    EventBus.dispatch('bitacora:diagnostico_anclado', {
+      poolId: poolId,
+
+      // Parámetros medidos (solo campos con valor no vacío)
+      parametros: parametrosAncla,
+
+      // Salud visual completa
+      salud: {
+        claridad: claridad,
+        naturaleza_color: naturalezaColor,
+        tipo_alga: tipoAlga,
+        olor: olor,
+        visibilidad_fondo: isNaN(visibilidadFondo) ? null : visibilidadFondo,
+        profundidad_visible: isNaN(profundidadVisible) ? null : profundidadVisible
+      },
+
+      // Campos adicionales que el engine también consume
+      tipo_servicio: tipoServicio,
+      tipo_alga: tipoAlga,
+      salud_agua: saludAgua,
+      lectura_colorq: lecturaColorQ,
+      estado_hidraulico: estadoHidraulico,
+      agua_llenado: aguaLlenado
+    });
+
+    // ── V17.2.3 FIX BUG-007: forzar recálculo inmediato tras el dispatch ──
+    if (window.Engine && typeof window.Engine.proyectarEstadoActual === 'function') {
+      try { window.Engine.proyectarEstadoActual(poolId); } catch(e) {}
+    }
+
+    // 8. Actualizar Isaías (si está disponible)
+    if (window.Isaias && Isaias.actualizarClaridadDesdeBitacora) {
+      try { Isaias.actualizarClaridadDesdeBitacora(poolId, saludAgua); }
+      catch (e) { console.warn('[Bitacora._anclarDiagnostico] Error en Isaias.actualizar:', e); }
+    }
+
+    // 9. Toast de éxito con modo activo (con pequeño delay para que engine procese)
+    setTimeout(() => {
+      const poolState = (window.DB && DB.getPoolState) ? DB.getPoolState(poolId) : null;
+      const modoActivo = (poolState && poolState.calculado && poolState.calculado.modo_operativo)
+                         ? poolState.calculado.modo_operativo : 'rutinario';
+      _toast('✅ Diagnóstico anclado. Modo: ' + modoActivo, 'ok');
+    }, 300);
+
+    // 10. Refrescar preview de impacto con nuevos umbrales
+    _recalcularTodosLosPreviews();
+
+    window.__bitacoraUltimoAncla = new Date().toISOString();
+  }
+
+  // ────────────────────────────────────────────────
+  //  V17.2.0 ADD — SUB-SELECTORES CONDICIONALES
+  // ────────────────────────────────────────────────
+
+  /**
+   * V17.2.0 ADD: muestra/oculta sub-selectores según tipo_servicio.
+   * @private
+   */
+  function _actualizarSubselectoresTipo() {
+    const tipo = document.getElementById('bit-tipo')
+                 ? document.getElementById('bit-tipo').value : '';
+    const cont = document.getElementById('bit-subselectores-tipo');
+    const grpAlga = document.getElementById('bit-grp-tipo-alga');
+    const grpMetal = document.getElementById('bit-grp-metal-presunto');
+    const grpRecub = document.getElementById('bit-grp-recubrimiento-confirmado');
+
+    if (!cont) return;
+
+    if (grpAlga) grpAlga.style.display = (tipo === 'algas') ? 'block' : 'none';
+    if (grpMetal) grpMetal.style.display = (tipo === 'recuperacion_metales') ? 'block' : 'none';
+    if (grpRecub) grpRecub.style.display = (tipo === 'correccion_sarro') ? 'block' : 'none';
+
+    cont.style.display = (tipo === 'algas' || tipo === 'recuperacion_metales' ||
+                          tipo === 'correccion_sarro') ? 'block' : 'none';
+
+    const acordeonSalud = document.getElementById('bit-acordeon-salud');
+    if (acordeonSalud && tipo && tipo !== 'rutina') {
+      acordeonSalud.open = true;
+    }
+  }
+
+  // ────────────────────────────────────────────────
+  //  FUNCIONES DE CARGA Y PRELLENADO
+  // ────────────────────────────────────────────────
+
+  /**
+   * Carga la lista de albercas en el selector.
+   * @private
+   */
+  function _cargarSelectorAlbercas() {
+    const select = $('bit-alberca');
+    if (!select) return;
+
+    select.innerHTML = '<option value="">— Selecciona alberca —</option>';
+
+    if (!window.DB) return;
+
+    const albercas = DB.getAlbercas();
+    albercas.forEach((alb) => {
+      const opt = document.createElement('option');
+      opt.value = alb.id;
+      const alias = alb.metadata?.alias_alberca || 'Sin nombre';
+      const cliente = alb.metadata?.cliente || '';
+      opt.textContent = cliente ? `${alias} (${cliente})` : alias;
+      select.appendChild(opt);
+    });
+  }
+
+  /**
+   * Pre-llena campos con datos del Gemelo Digital activo.
+   * @param {Object} gemelo
+   * @private
+   */
+  function _prellenarDatosGemelo(gemelo) {
+    if (!gemelo) return;
+
+    const geo = gemelo.geometria_adn || {};
+    const hid = gemelo.auditoria_hidraulica || {};
+    const pzq = gemelo.punto_cero_quimico || {};
+
+    const volInfo = $('bit-info-volumen');
+    if (volInfo) volInfo.textContent = `${geo.volumen_m3 || 0} m³ (${((geo.volumen_m3 || 0) * 1000).toFixed(0)} L)`;
+
+    const flujoInfo = $('bit-info-flujo-desague');
+    if (flujoInfo) flujoInfo.textContent = `${hid.bomba?.flujo_real_lpm || 0} LPM`;
+
+    const flujoLlenadoInfo = $('bit-info-flujo-llenado');
+    if (flujoLlenadoInfo) flujoLlenadoInfo.textContent = `${hid.bomba?.flujo_llenado_lpm || 0} LPM`;
+
+    const psiInfo = $('bit-info-psi-limpio');
+    if (psiInfo) psiInfo.textContent = `${hid.filtro?.psi_limpio || 0} PSI`;
+
+    const cyaBase = $('bit-info-cya-base');
+    if (cyaBase) cyaBase.textContent = `${pzq.cianurico || 0} ppm`;
+
+    const durezaBase = $('bit-info-dureza-base');
+    if (durezaBase) durezaBase.textContent = `${pzq.dureza || 0} ppm`;
+
+    if (window.DB) {
+      const ultimo = DB.getUltimoRegistro(gemelo.id);
+      if (ultimo && ultimo.parametros) {
+        const tempField = $('bit-temperatura');
+        if (tempField && !tempField.value) {
+          tempField.value = ultimo.parametros.temperatura || '';
+        }
+      }
+    }
+  }
+
+  /**
+   * Se ejecuta cuando el técnico cambia la alberca seleccionada.
+   * @private
+   */
+  function _onAlbercaChange() {
+    const select = $('bit-alberca');
+    if (!select) return;
+
+    _albercaActivaId = select.value || null;
+
+    if (!_albercaActivaId || !window.DB) {
+      _gemeloActivo = null;
+      _recalcularTodosLosPreviews();
+      return;
+    }
+
+    _gemeloActivo = DB.getAlberca(_albercaActivaId);
+    _prellenarDatosGemelo(_gemeloActivo);
+
+    if (window.EventBus) {
+      window.EventBus.dispatch('bitacora:alberca_seleccionada', {
+        poolId: _albercaActivaId,
+        alias: _gemeloActivo?.metadata?.alias_alberca || '',
+        timestamp: _nowISO()
+      });
+    }
+
+    _recalcularTodosLosPreviews();
+
+    console.info(`[Bitácora] Alberca activa: ${_albercaActivaId}`);
+  }
+
+  // ────────────────────────────────────────────────
+  //  CRONÓMETRO DE RETROLAVADO
+  // ────────────────────────────────────────────────
+
+  function _iniciarCronoRetro() {
+    if (_cronometroRetroActivo) return;
+
+    _cronometroRetroActivo = true;
+    _cronometroRetroSegundos = 0;
+    _retroDetenerPrimerClic = false;
+
+    const display = $('crono-retro-display');
+    const btnIniciar = $('btn-iniciar-retro');
+    const btnDetener = $('btn-detener-retro');
+
+    if (display) display.textContent = '00:00';
+    if (btnIniciar) btnIniciar.disabled = true;
+    if (btnDetener) {
+      btnDetener.disabled = false;
+      btnDetener.textContent = 'Detener Retrolavado';
+    }
+
+    _cronometroRetroInterval = setInterval(() => {
+      _cronometroRetroSegundos++;
+      if (display) display.textContent = _formatCrono(_cronometroRetroSegundos);
+      if (_cronometroRetroSegundos % 10 === 0) _actualizarReporteRetroVivo();
+    }, 1000);
+
+    _toast('Cronómetro de retrolavado iniciado', 'info');
+  }
+
+  function _detenerCronoRetro() {
+    if (!_cronometroRetroActivo) return;
+
+    if (!_retroDetenerPrimerClic) {
+      _retroDetenerPrimerClic = true;
+      const btnDetener = $('btn-detener-retro');
+      if (btnDetener) {
+        btnDetener.textContent = '⚠️ Clic de nuevo para CONFIRMAR';
+        btnDetener.style.background = '#f59e0b';
+      }
+      _retroDetenerTimeout = setTimeout(() => {
+        _retroDetenerPrimerClic = false;
+        if (btnDetener) {
+          btnDetener.textContent = 'Detener Retrolavado';
+          btnDetener.style.background = '';
+        }
+      }, 3000);
+      return;
+    }
+
+    clearTimeout(_retroDetenerTimeout);
+    clearInterval(_cronometroRetroInterval);
+    _cronometroRetroActivo = false;
+    _retroDetenerPrimerClic = false;
+
+    const btnIniciar = $('btn-iniciar-retro');
+    const btnDetener = $('btn-detener-retro');
+
+    if (btnIniciar) btnIniciar.disabled = false;
+    if (btnDetener) {
+      btnDetener.disabled = true;
+      btnDetener.textContent = 'Detener Retrolavado';
+      btnDetener.style.background = '';
+    }
+
+    const minutos = _cronometroRetroSegundos / 60;
+    const campoMin = $('bit-duracion-min');
+    if (campoMin) campoMin.value = minutos.toFixed(1);
+
+    _actualizarReporteRetroVivo();
+    _toast(`Retrolavado: ${_formatCrono(_cronometroRetroSegundos)} (${minutos.toFixed(1)} min)`, 'success');
+  }
+
+  function _actualizarReporteRetroVivo() {
+    const panel = $('retro-live-report');
+    if (!panel) return;
+
+    const minutos = _cronometroRetroActivo
+      ? _cronometroRetroSegundos / 60
+      : _numVal('bit-duracion-min', 0);
+
+    if (minutos <= 0 || !_gemeloActivo) {
+      panel.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">' +
+        '⏱️ Ingresa el tiempo para calcular el impacto de masa.</span>';
+      return;
+    }
+
+    const flujoDesague = parseFloat(_gemeloActivo.auditoria_hidraulica?.bomba?.flujo_real_lpm) || 0;
+    const volM3 = parseFloat(_gemeloActivo.geometria_adn?.volumen_m3) || 0;
+
+    if (flujoDesague <= 0) {
+      panel.innerHTML = '<div style="color:#f59e0b;font-size:0.82rem">' +
+        '⚠️ Configura el Flujo de desagüe (LPM) en el Expediente Maestro.</div>';
+      return;
+    }
+
+    const litros = parseFloat((minutos * flujoDesague).toFixed(1));
+    const volLitros = volM3 * 1000;
+    const fraccion = volLitros > 0 ? (litros / volLitros) : 0;
+
+    let html = `
+      <div style="font-size:0.78rem;margin-top:6px;padding:8px;background:rgba(180,147,9,0.08);border-radius:6px">
+        <strong style="color:#b45309">🔄 Retrolavado en vivo</strong><br>
+        ⏱️ ${minutos.toFixed(1)} min × ${flujoDesague} LPM = <strong>${litros.toLocaleString('es-MX')} L</strong>
+        (${(fraccion * 100).toFixed(1)}% del vaso)
+      </div>
+    `;
+
+    if (window.Chemistry && typeof window.Chemistry.calcularRetrolavado === 'function' && _albercaActivaId) {
+      try {
+        const res = window.Chemistry.calcularRetrolavado(_albercaActivaId, minutos);
+        if (res && !res.error && res.html) html = res.html;
+      } catch (e) { /* silenciar */ }
+    }
+
+    panel.innerHTML = html;
+  }
+
+  // ────────────────────────────────────────────────
+  //  CRONÓMETRO DE LLENADO
+  // ────────────────────────────────────────────────
+
+  function _iniciarCronoLlenado() {
+    if (_cronometroLlenadoActivo) return;
+
+    _cronometroLlenadoActivo = true;
+    _cronometroLlenadoSegundos = 0;
+    _llenadoDetenerPrimerClic = false;
+
+    const display = $('crono-llenado-display');
+    const btnIniciar = $('btn-iniciar-llenado');
+    const btnDetener = $('btn-detener-llenado');
+
+    if (display) display.textContent = '00:00';
+    if (btnIniciar) btnIniciar.disabled = true;
+    if (btnDetener) {
+      btnDetener.disabled = false;
+      btnDetener.textContent = 'Detener Llenado';
+    }
+
+    _cronometroLlenadoInterval = setInterval(() => {
+      _cronometroLlenadoSegundos++;
+      if (display) display.textContent = _formatCrono(_cronometroLlenadoSegundos);
+    }, 1000);
+
+    _toast('Cronómetro de llenado iniciado', 'info');
+  }
+
+  function _detenerCronoLlenado() {
+    if (!_cronometroLlenadoActivo) return;
+
+    if (!_llenadoDetenerPrimerClic) {
+      _llenadoDetenerPrimerClic = true;
+      const btnDetener = $('btn-detener-llenado');
+      if (btnDetener) {
+        btnDetener.textContent = '⚠️ Clic de nuevo para CONFIRMAR';
+        btnDetener.style.background = '#f59e0b';
+      }
+      _llenadoDetenerTimeout = setTimeout(() => {
+        _llenadoDetenerPrimerClic = false;
+        if (btnDetener) {
+          btnDetener.textContent = 'Detener Llenado';
+          btnDetener.style.background = '';
+        }
+      }, 3000);
+      return;
+    }
+
+    clearTimeout(_llenadoDetenerTimeout);
+    clearInterval(_cronometroLlenadoInterval);
+    _cronometroLlenadoActivo = false;
+    _llenadoDetenerPrimerClic = false;
+
+    const btnIniciar = $('btn-iniciar-llenado');
+    const btnDetener = $('btn-detener-llenado');
+
+    if (btnIniciar) btnIniciar.disabled = false;
+    if (btnDetener) {
+      btnDetener.disabled = true;
+      btnDetener.textContent = 'Detener Llenado';
+      btnDetener.style.background = '';
+    }
+
+    const minutos = _cronometroLlenadoSegundos / 60;
+    const flujoLlenado = parseFloat(_gemeloActivo?.auditoria_hidraulica?.bomba?.flujo_llenado_lpm) || 0;
+    const litros = minutos * flujoLlenado;
+
+    const campoLitros = $('bit-litros-llenado');
+    if (campoLitros) campoLitros.value = litros.toFixed(0);
+
+    _actualizarReporteLlenadoVivo();
+    _toast(`Llenado: ${litros.toFixed(0)} litros en ${_formatCrono(_cronometroLlenadoSegundos)}`, 'success');
+  }
+
+  function _actualizarReporteLlenadoVivo() {
+    const panel = $('llenado-live-report');
+    if (!panel) return;
+
+    const litros = _numVal('bit-litros-llenado', 0);
+    if (litros <= 0 || !_gemeloActivo) { panel.innerHTML = ''; return; }
+
+    const volM3 = parseFloat(_gemeloActivo.geometria_adn?.volumen_m3) || 0;
+    const volLitros = volM3 * 1000;
+    const fraccion = volLitros > 0 ? (litros / volLitros * 100).toFixed(1) : '?';
+
+    panel.innerHTML = `
+      <div style="font-size:0.78rem;padding:8px;background:rgba(59,130,246,0.08);border-radius:6px;margin-top:6px">
+        <strong style="color:#3b82f6">💧 Llenado</strong><br>
+        ${litros.toLocaleString('es-MX')} L añadidos (${fraccion}% del vaso).
+        El motor recalculará la dilución al guardar.
+      </div>
+    `;
+  }
+
+  // ────────────────────────────────────────────────
+  //  CLORO COMBINADO (AUTO-CÁLCULO)
+  // ────────────────────────────────────────────────
+
+  function _calcularCloroCombinado() {
+    const libre = _numVal('bit-cloro-libre', 0);
+    const total = _numVal('bit-cloro-total', 0);
+    const campo = $('bit-cloro-combinado');
+    if (campo) campo.value = Math.max(0, total - libre).toFixed(2);
+  }
+
+  // ────────────────────────────────────────────────
+  //  PANEL COLORQ (PLEGABLE)
+  // ────────────────────────────────────────────────
+
+  /**
+   * Toggle del panel plegable de lectura ColorQ.
+   * V16.6.3 FIX COLORQ-TOGGLE: conservada para uso programático.
+   * @private
+   */
+  function _togglePanelColorQ() {
+    const panel = $('panel-colorq');
+    const btn = $('btn-toggle-colorq');
+    if (!panel) return;
+    const visible = panel.style.display !== 'none';
+    panel.style.display = visible ? 'none' : 'block';
+    if (btn) {
+      btn.textContent = visible
+        ? '📊 Mostrar Lectura ColorQ Pro 7'
+        : '📊 Ocultar Lectura ColorQ Pro 7';
+    }
+  }
+
+  // ────────────────────────────────────────────────
+  //  DOSIFICACIÓN DINÁMICA
+  // ────────────────────────────────────────────────
+
+  /**
+   * Claves de productos considerados "cloro" para el bloqueo en modo metales.
+   * V17.2.3 FIX BUG-002.
+   * @private
+   */
+  const _CLAVES_CLORO = new Set([
+    'tricloro-polvo', 'tricloro-tab3', 'tricloro-tab1',
+    'hipoclorito-calcio',
+    'cloro-liquido'
+  ]);
+
+  /**
+   * Añade una nueva fila de dosificación al contenedor.
+   * V16.7.0 MOD: preview en vivo + listeners de debounce.
+   * V16.7.0 GEMINI-MOD: selector de modo ácido para ácido muriático.
+   * V17.2.3 FIX BUG-002: verifica modo_operativo antes de agregar
+   *   productos clorados cuando el modo es 'metales'.
+   * @private
+   */
+  function _agregarFilaDosificacion() {
+    // ── V17.2.3 FIX BUG-002: bloqueo preventivo al agregar fila ──
+    // (El bloqueo por producto específico se hace en el listener 'change'
+    //  del selector de producto; aquí se hace la comprobación inicial
+    //  para la fila recién agregada antes de que el usuario elija producto.)
+    // La comprobación real por producto se aplica al momento de elegir
+    // el producto dentro de la fila — ver selProd.addEventListener('change').
+
+    const container = $('dosificacion-container');
+    if (!container) return;
+
+    _dosificacionRowCounter++;
+    const rowId = `dosis-row-${_dosificacionRowCounter}`;
+
+    const row = document.createElement('div');
+    row.id = rowId;
+    row.className = 'dosis-row';
+    row.style.cssText =
+      'display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px;' +
+      'margin-bottom:6px;background:rgba(0,0,0,0.02);border-radius:6px;border:1px solid rgba(0,0,0,0.06);';
+
+    // Select de categoría
+    const selCat = document.createElement('select');
+    selCat.className = 'dosis-categoria';
+    selCat.style.cssText = 'flex:1;min-width:120px;padding:6px;border-radius:4px;border:1px solid #ccc;font-size:0.82rem;';
+    selCat.innerHTML = '<option value="">Categoría...</option>';
+    CATEGORIAS_PRODUCTO.forEach((cat) => {
+      const opt = document.createElement('option');
+      opt.value = cat.value;
+      opt.textContent = cat.label;
+      selCat.appendChild(opt);
+    });
+
+    // Select de producto
+    const selProd = document.createElement('select');
+    selProd.className = 'dosis-producto';
+    selProd.style.cssText = 'flex:2;min-width:160px;padding:6px;border-radius:4px;border:1px solid #ccc;font-size:0.82rem;';
+    selProd.innerHTML = '<option value="">Producto...</option>';
+    selProd.disabled = true;
+
+    // Input de cantidad
+    const inputCant = document.createElement('input');
+    inputCant.type = 'number';
+    inputCant.className = 'dosis-cantidad';
+    inputCant.placeholder = 'Cant.';
+    inputCant.min = '0';
+    inputCant.step = 'any';
+    inputCant.style.cssText = 'width:70px;padding:6px;border-radius:4px;border:1px solid #ccc;font-size:0.82rem;text-align:right;';
+
+    // Span de unidad
+    const spanUnidad = document.createElement('span');
+    spanUnidad.className = 'dosis-unidad';
+    spanUnidad.style.cssText = 'font-size:0.78rem;color:#666;min-width:24px;';
+    spanUnidad.textContent = '-';
+
+    // Botón eliminar
+    const btnElim = document.createElement('button');
+    btnElim.type = 'button';
+    btnElim.textContent = '✕';
+    btnElim.title = 'Eliminar producto';
+    btnElim.style.cssText =
+      'background:#ef4444;color:#fff;border:none;border-radius:50%;width:28px;height:28px;' +
+      'cursor:pointer;font-size:0.9rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;';
+
+    // V16.7.0 GEMINI-MOD — Opciones de modo ácido
+    const rowOpcionesAcido = document.createElement('div');
+    rowOpcionesAcido.className = 'dosis-opciones-acido';
+    rowOpcionesAcido.style.cssText =
+      'flex-basis: 100%; display: none; padding: 4px 8px; background: #fefce8; border-radius: 4px; font-size: 0.8rem; color: #854d0e;';
+    rowOpcionesAcido.innerHTML = `
+      <label style="margin-right: 12px; cursor: pointer;">
+        <input type="radio" name="modo_acido_${rowId}" value="ph" checked> Bajar pH
+      </label>
+      <label style="cursor: pointer;">
+        <input type="radio" name="modo_acido_${rowId}" value="alk"> Bajar Alcalinidad
+      </label>
+    `;
+
+    // ── Eventos ──
+
+    selCat.addEventListener('change', () => {
+      const cat = selCat.value;
+      selProd.innerHTML = '<option value="">Producto...</option>';
+      selProd.disabled = !cat;
+      spanUnidad.textContent = '-';
+      rowOpcionesAcido.style.display = 'none';
+
+      if (cat && PRODUCTOS_POR_CATEGORIA[cat]) {
+        PRODUCTOS_POR_CATEGORIA[cat].forEach((prod) => {
+          const opt = document.createElement('option');
+          opt.value = prod.clave;
+          opt.textContent = prod.nombre;
+          opt.dataset.unidad = prod.unidad;
+          selProd.appendChild(opt);
+        });
+      }
+
+      _programarPreviewFila(row);
+    });
+
+    // V17.2.3 FIX BUG-002: verificar modo metales al elegir producto
+    selProd.addEventListener('change', () => {
+      const selected = selProd.selectedOptions[0];
+      spanUnidad.textContent = selected?.dataset?.unidad || '-';
+      rowOpcionesAcido.style.display =
+        (selProd.value === 'acido-muriatico' || selProd.value === 'acido') ? 'block' : 'none';
+
+      // ── V17.2.3 FIX BUG-002 ──
+      // Si el modo operativo actual es 'metales' y el producto es clorado, bloquear.
+      if (_CLAVES_CLORO.has(selProd.value)) {
+        let modoActual = 'rutinario';
+        try {
+          if (window.DB && typeof DB.getPoolState === 'function' && _albercaActivaId) {
+            const ps = DB.getPoolState(_albercaActivaId);
+            if (ps && ps.calculado && ps.calculado.modo_operativo) {
+              modoActual = ps.calculado.modo_operativo;
+            }
+          }
+        } catch (e) { /* silenciar */ }
+
+        if (modoActual === 'metales') {
+          _toast('⛔ Modo metales activo: no se permite añadir cloro. Usa secuestrante.', 'error', 5000);
+          // Revertir selección a vacía para que no quede registrada
+          selProd.value = '';
+          spanUnidad.textContent = '-';
+          _renderPreviewImpacto(row, null, 'Producto bloqueado en modo metales.');
+          return;
+        }
+      }
+      // ── FIN V17.2.3 FIX BUG-002 ──
+
+      _programarPreviewFila(row);
+    });
+
+    rowOpcionesAcido.querySelectorAll('input[type="radio"]').forEach(r => {
+      r.addEventListener('change', () => _programarPreviewFila(row));
+    });
+
+    inputCant.addEventListener('input', () => _programarPreviewFila(row));
+    inputCant.addEventListener('change', () => _programarPreviewFila(row));
+
+    btnElim.addEventListener('click', () => {
+      const t = _previewDebounce.get(row.id);
+      if (t) { clearTimeout(t); _previewDebounce.delete(row.id); }
+      row.remove();
+      _actualizarEstadoGuardado();
+    });
+
+    row.appendChild(selCat);
+    row.appendChild(selProd);
+    row.appendChild(inputCant);
+    row.appendChild(spanUnidad);
+    row.appendChild(btnElim);
+    row.appendChild(rowOpcionesAcido);
+
+    container.appendChild(row);
+
+    _renderPreviewImpacto(row, null, 'Ingresa producto y cantidad para ver el impacto químico estimado.');
+  }
+
+  /**
+   * Recoge todas las filas de dosificación como array.
+   * V16.7.0 GEMINI-MOD: incluye modo_acido si aplica.
+   * @returns {Array}
+   * @private
+   */
+  function _recogerDosificaciones() {
+    const container = $('dosificacion-container');
+    if (!container) return [];
+
+    const filas = container.querySelectorAll('.dosis-row');
+    const dosificaciones = [];
+
+    filas.forEach((fila) => {
+      const selProd = fila.querySelector('.dosis-producto');
+      const inputCant = fila.querySelector('.dosis-cantidad');
+      const selCat = fila.querySelector('.dosis-categoria');
+      const spanUnidad = fila.querySelector('.dosis-unidad');
+
+      if (!selProd || !inputCant) return;
+
+      const clave = selProd.value;
+      const cantidad = parseFloat(inputCant.value) || 0;
+
+      if (!clave || cantidad <= 0) return;
+
+      const selected = selProd.selectedOptions[0];
+
+      let modoAcido = undefined;
+      if (clave === 'acido-muriatico' || clave === 'acido') {
+        const radio = fila.querySelector(`input[name="modo_acido_${fila.id}"]:checked`);
+        if (radio) modoAcido = radio.value;
+      }
+
+      dosificaciones.push({
+        clave,
+        nombre: selected?.textContent || clave,
+        cantidad,
+        unidad: spanUnidad?.textContent || 'g',
+        categoria: selCat?.value || '',
+        modo_acido: modoAcido
+      });
+    });
+
+    return dosificaciones;
+  }
+
+  // ────────────────────────────────────────────────
+  //  ANCLA DE REALIDAD (GUARDAR LECTURA COMO DATO DURO)
+  // ────────────────────────────────────────────────
+
+  /**
+   * V16.6.4 FIX ANCLA-PARCIAL: ancla solo campos medidos por el técnico.
+   * @private
+   */
+  function _anclarLecturaColorQ() {
+    if (!_albercaActivaId) {
+      _toast('Selecciona una alberca primero.', 'warning');
+      return;
+    }
+
+    function _getMedidoOrNull(inputId) {
+      var el = document.getElementById(inputId);
+      if (!el) return null;
+      if (el.classList.contains('colorq-prellenado')) return null;
+      if (el.value === '' || el.value === null || el.value === undefined) return null;
+      var v = parseFloat(el.value);
+      return isNaN(v) ? null : v;
+    }
+
+    var ph = _getMedidoOrNull('bit-ph');
+    var cloro_libre = _getMedidoOrNull('bit-cloro-libre');
+
+    if (ph === null && cloro_libre === null) {
+      _toast('Ingresa al menos pH o Cloro Libre (borra el valor pre-llenado y escribe tu medición).', 'warning');
+      return;
+    }
+    if (ph !== null && (ph < 0 || ph > 14)) {
+      _toast('pH debe estar entre 0 y 14.', 'warning');
+      return;
+    }
+    if (cloro_libre !== null && (cloro_libre < 0 || cloro_libre > 20)) {
+      _toast('Cloro libre debe estar entre 0 y 20 ppm.', 'warning');
+      return;
+    }
+
+    var data = {
+      cloro_libre: cloro_libre,
+      ph: ph,
+      alcalinidad: _getMedidoOrNull('bit-alcalinidad'),
+      dureza_calcica: _getMedidoOrNull('bit-dureza'),
+      cianurico: _getMedidoOrNull('bit-cianurico'),
+      tds: _getMedidoOrNull('bit-tds'),
+      temperatura: _getMedidoOrNull('bit-temperatura'),
+      cloro_total: _getMedidoOrNull('bit-cloro-total'),
+      notas_tecnico: 'Lectura ColorQ Pro 7 — Dato duro anclado. Solo los campos medidos por el técnico actualizan el gemelo.',
+      fuente: 'ColorQ'
+    };
+
+    try {
+      if (window.DB) {
+        DB.saveRegistro(_albercaActivaId, data);
+      }
+      _toast('Lectura anclada. Solo los campos que mediste actualizan el gemelo.', 'success');
+      _recalcularTodosLosPreviews();
+    } catch (err) {
+      console.error('[Bitácora] Error al anclar lectura:', err);
+      _toast('Error al guardar lectura: ' + err.message, 'error');
+    }
+  }
+
+  // ────────────────────────────────────────────────
+  //  CONSTRUCCIÓN Y GUARDADO DEL SERVICIO
+  // ────────────────────────────────────────────────
+
+  /**
+   * V17.2.0 MOD: contrato JSON V17.2.
+   * @returns {Object|null}
+   * @private
+   */
+  function _construirObjetoServicio() {
+    if (!_albercaActivaId) {
+      _toast('Selecciona una alberca antes de guardar.', 'error');
+      return null;
+    }
+
+    const ahora = new Date().toISOString();
+    const idServicio = 'srv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+
+    const tipoServicio = document.getElementById('bit-tipo')?.value || '';
+    const tipoAlgaServ = document.getElementById('bit-tipo-alga')?.value || null;
+    const metalPres = document.getElementById('bit-metal-presunto')?.value || null;
+    const recubConf = document.getElementById('bit-recubrimiento-confirmado')?.value || null;
+
+    const saludAgua = {
+      claridad_actual: parseInt(document.getElementById('bit-claridad')?.value, 10),
+      naturaleza_color: document.querySelector('input[name="bit-naturaleza-color"]:checked')?.value || 'ninguna',
+      tipo_alga: document.getElementById('bit-tipo-alga-presunta')?.value || 'ninguna',
+      visibilidad_fondo_m: parseFloat(document.getElementById('bit-visibilidad-fondo')?.value) || null,
+      profundidad_visible_m: parseFloat(document.getElementById('bit-profundidad-visible')?.value) || null,
+      olor: document.getElementById('bit-olor')?.value || 'ninguno'
+    };
+
+    const lecturaColorQ = _recogerLecturaColorQ();
+
+    const estadoHidraulico = {
+      psi_llegada: parseFloat(document.getElementById('bit-psi-llegada')?.value) || null,
+      nivel_vaso: document.getElementById('bit-nivel-vaso')?.value || 'normal',
+      observacion_bomba: document.getElementById('bit-obs-bomba')?.value || '',
+      observacion_filtro: document.getElementById('bit-obs-filtro')?.value || ''
+    };
+
+    let aguaLlenado = null;
+    const litrosLlenado = parseFloat(document.getElementById('bit-litros-llenado')?.value) || 0;
+    if (litrosLlenado > 0) {
+      aguaLlenado = {
+        fuente: document.getElementById('bit-fuente-agua')?.value || 'red',
+        ph: parseFloat(document.getElementById('bit-llenado-ph')?.value) || null,
+        alcalinidad: parseFloat(document.getElementById('bit-llenado-alk')?.value) || null,
+        dureza: parseFloat(document.getElementById('bit-llenado-dureza')?.value) || null,
+        cianurico: parseFloat(document.getElementById('bit-llenado-cya')?.value) || null,
+        tds: parseFloat(document.getElementById('bit-llenado-tds')?.value) || null,
+        temperatura: parseFloat(document.getElementById('bit-llenado-temp')?.value) || null,
+        litros_aportados: litrosLlenado
+      };
+    }
+
+    const poolState = (window.DB && DB.getPoolState) ? DB.getPoolState(_albercaActivaId) : null;
+    const modoActivo = (poolState && poolState.calculado && poolState.calculado.modo_operativo)
+                       ? poolState.calculado.modo_operativo : 'rutinario';
+
+    return {
+      id: idServicio,
+      pool_id: _albercaActivaId,
+      timestamp: ahora,
+      tecnico: _strVal('bit-tecnico', 'Omar Valle'),
+      firma: FIRMA,
+      version_bitacora: VERSION,
+
+      tipo_servicio: tipoServicio,
+      tipo_alga: tipoAlgaServ,
+      metal_presunto: metalPres,
+      recubrimiento_confirmado: recubConf,
+      modo_operativo_activo: modoActivo,
+
+      salud_agua: saludAgua,
+      lectura_colorq: lecturaColorQ,
+      estado_hidraulico_llegada: estadoHidraulico,
+      agua_llenado: aguaLlenado,
+      checklist_mecanico: _recogerChecklist(),
+      tiempos_operacion: _recogerTiemposOperacion(),
+      balance_hidrico: _recogerBalanceHidrico(),
+      dosificaciones: _recogerDosificaciones(),
+      factores_externos: _recogerFactoresExternos(),
+      observaciones: document.getElementById('bit-observaciones')?.value || '',
+      diagnostico_anclado_en: window.__bitacoraUltimoAncla || null,
+      descontar_inventario: document.getElementById('bit-descontar-inv')?.checked !== false
+    };
+  }
+
+  function _recogerLecturaColorQ() {
+    return {
+      ph: _numVal('bit-ph'),
+      cloro_libre: _numVal('bit-cloro-libre'),
+      cloro_total: _numVal('bit-cloro-total'),
+      cloro_combinado: _numVal('bit-cloro-combinado'),
+      alcalinidad: _numVal('bit-alcalinidad'),
+      dureza_calcica: _numVal('bit-dureza'),
+      cianurico: _numVal('bit-cianurico'),
+      tds: _numVal('bit-tds'),
+      temperatura: _numVal('bit-temperatura'),
+      turbidez: _strVal('bit-turbidez', 'cristalina')
+    };
+  }
+
+  function _recogerChecklist() {
+    return {
+      cepillado: _checked('chk-cepillado'),
+      aspirado: _checked('chk-aspirado'),
+      canastillas: _checked('chk-canastillas'),
+      red_hojas: _checked('chk-red'),
+      filtro_presion: _checked('chk-filtro'),
+      nivel_agua: _checked('chk-nivel')
+    };
+  }
+
+  function _recogerTiemposOperacion() {
+    return {
+      horas_filtracion: _numVal('bit-horas-filtracion'),
+      horas_hidrojets: _numVal('bit-horas-hidrojets'),
+      horas_cascadas: _numVal('bit-horas-cascadas')
+    };
+  }
+
+  function _recogerBalanceHidrico() {
+    const retroMin = _numVal('bit-duracion-min');
+    const llenadoLitros = _numVal('bit-litros-llenado');
+    let litrosRetro = 0;
+    if (retroMin > 0 && _gemeloActivo) {
+      const flujo = parseFloat(_gemeloActivo.auditoria_hidraulica?.bomba?.flujo_real_lpm) || 0;
+      litrosRetro = parseFloat((retroMin * flujo).toFixed(1));
+    }
+    return {
+      retrolavado: { realizado: retroMin > 0, duracion_min: retroMin, litros_perdidos: litrosRetro },
+      llenado: { realizado: llenadoLitros > 0, litros_agregados: llenadoLitros }
+    };
+  }
+
+  function _recogerFactoresExternos() {
+    return {
+      evento_norte: _checked('chk-evento-norte'),
+      lluvia_intensa: _checked('chk-lluvia'),
+      pool_party: _checked('chk-pool-party'),
+      hojas_materia_organica: _checked('chk-hojas')
+    };
+  }
+
+  // ────────────────────────────────────────────────
+  //  GUARDADO DE BITÁCORA
+  // ────────────────────────────────────────────────
+
+  /**
+   * Guarda la bitácora completa.
+   * V16.7.0 MOD: aborta si hay filas bloqueadas.
+   * V16.7.0 GEMINI-MOD: propaga modo_acido.
+   * V17.2.3 FIX N-02: persistencia vía DB.saveServicio (elimina bloque
+   *   localStorage directo). Sin localStorage en este módulo.
+   * @private
+   */
+  function _guardarBitacora() {
+    try {
+      // Guarda de seguridad: si alguna fila está bloqueada, abortar.
+      const containerDos = $('dosificacion-container');
+      const bloqueadas = containerDos ? containerDos.querySelectorAll('.dosis-row.dosis-bloqueada').length : 0;
+      if (bloqueadas > 0) {
+        _toast(`No se puede guardar: ${bloqueadas} dosis fuera de rango seguro. Ajusta antes de continuar.`, 'error', 4500);
+        return;
+      }
+
+      const servicio = _construirObjetoServicio();
+      if (!servicio) return;
+
+      // ── 1. Descontar inventario ──
+      if (servicio.descontar_inventario && servicio.dosificaciones.length > 0 && window.DB) {
+        servicio.dosificaciones.forEach((dosis) => {
+          try {
+            DB.descontarInventario(dosis.clave, dosis.cantidad);
+          } catch (err) {
+            console.warn(`[Bitácora] No se pudo descontar ${dosis.clave}:`, err.message);
+          }
+        });
+      }
+
+      // ── 2. Guardar lectura ColorQ como registro (si tiene datos) ──
+      const lc = servicio.lectura_colorq;
+      const tieneColorQ = lc.ph > 0 || lc.cloro_libre > 0;
+
+      if (tieneColorQ && window.DB) {
+        try {
+          DB.saveRegistro(servicio.pool_id, {
+            cloro_libre: lc.cloro_libre,
+            ph: lc.ph,
+            alcalinidad: lc.alcalinidad,
+            dureza_calcica: lc.dureza_calcica,
+            cianurico: lc.cianurico,
+            tds: lc.tds,
+            temperatura: lc.temperatura,
+            notas_tecnico: `Bitácora ${servicio.tipo_servicio} — ${servicio.tecnico}`,
+            fuente: 'ColorQ'
+          });
+        } catch (err) {
+          console.warn('[Bitácora] Error al guardar registro ColorQ:', err.message);
+        }
+      }
+
+      // ── 3. Persistir el servicio ── V17.2.3 FIX N-02
+      if (window.DB && typeof window.DB.saveServicio === 'function') {
+        try {
+          DB.saveServicio(servicio.pool_id, servicio);
+        } catch (err) {
+          console.error('[Bitácora] Error al guardar servicio:', err);
+          _toast('Error al guardar bitácora');
+        }
+      } else {
+        console.error('[Bitácora] DB.saveServicio no disponible');
+        _toast('Error: DB no disponible');
+      }
+
+      // ── 4. Disparar eventos para el Engine ──
+      if (window.EventBus) {
+        if (servicio.balance_hidrico && servicio.balance_hidrico.retrolavado.realizado) {
+          window.EventBus.dispatch('bitacora:guardada', {
+            poolId: servicio.pool_id,
+            tipo: 'RETROLAVADO',
+            tipoEvento: 'RETROLAVADO',
+            litros_perdidos: servicio.balance_hidrico.retrolavado.litros_perdidos,
+            duracion_min: servicio.balance_hidrico.retrolavado.duracion_min,
+            timestamp: servicio.timestamp
+          });
+        }
+
+        if (servicio.balance_hidrico && servicio.balance_hidrico.llenado.realizado) {
+          const volActualL = (parseFloat(_gemeloActivo?.geometria_adn?.volumen_m3) || 0) * 1000;
+          window.EventBus.dispatch('bitacora:guardada', {
+            poolId: servicio.pool_id,
+            tipo: 'LLENADO',
+            tipoEvento: 'LLENADO',
+            litros_agregados: servicio.balance_hidrico.llenado.litros_agregados,
+            volumen_actual_litros: volActualL,
+            timestamp: servicio.timestamp
+          });
+        }
+
+        if (servicio.dosificaciones.length > 0) {
+          const pzq = (_gemeloActivo && _gemeloActivo.punto_cero_quimico) || {};
+          const geo = (_gemeloActivo && _gemeloActivo.geometria_adn) || {};
+          const recubrimientoCtx = (geo.recubrimiento && geo.recubrimiento.tipo)
+            ? String(geo.recubrimiento.tipo).toLowerCase()
+            : 'porcelanato';
+
+          const contextoGemelo = {
+            ph:             lc.ph             || pzq.ph             || 7.4,
+            alcalinidad:    lc.alcalinidad    || pzq.alcalinidad    || 100,
+            temperatura:    lc.temperatura    || pzq.temperatura_llenado || 28,
+            dureza:         lc.dureza_calcica || pzq.dureza         || 250,
+            cianurico:      lc.cianurico      || pzq.cianurico      || 30,
+            tds:            lc.tds            || 0,
+            recubrimiento:  recubrimientoCtx
+          };
+
+          const deltas = {};
+          const tieneFnNueva = window.Chemistry &&
+                               typeof window.Chemistry.calcDeltaPorAplicacion === 'function';
+
+          if (!tieneFnNueva) {
+            console.warn('[Bitácora] Chemistry.calcDeltaPorAplicacion no disponible. ' +
+                         'Actualiza chemistry.js a V16.4.2. Deltas omitidos para no corromper el gemelo.');
+          } else if (_gemeloActivo) {
+            const volM3 = parseFloat(geo.volumen_m3) || 50;
+
+          // V17.2.4 MOD FIX DELTA-PH-RESCATE: usar wrapper inteligente
+            const modoOpServicio = servicio.modo_operativo_activo || 'rutinario';
+
+            servicio.dosificaciones.forEach((dosis) => {
+              try {
+                const unidadLower = (dosis.unidad || '').toString().toLowerCase();
+                const ctxDosis = Object.assign({}, contextoGemelo);
+                if (dosis.modo_acido) ctxDosis.modo_acido = dosis.modo_acido;
+
+                const res = _calcularDeltasInteligente(
+                  dosis.clave, dosis.cantidad, unidadLower, volM3, ctxDosis, modoOpServicio
+                );
+                if (res) {
+                  if (res.deltaCl  != null) deltas.cloro_libre    = (deltas.cloro_libre    || 0) + res.deltaCl;
+                  if (res.deltaCYA != null) deltas.cianurico      = (deltas.cianurico      || 0) + res.deltaCYA;
+                  if (res.deltaCH  != null) deltas.dureza_calcica = (deltas.dureza_calcica || 0) + res.deltaCH;
+                  if (res.deltaALK != null) deltas.alcalinidad    = (deltas.alcalinidad    || 0) + res.deltaALK;
+                  if (res.deltaPH  != null) deltas.ph             = (deltas.ph             || 0) + res.deltaPH;
+
+                  // Log diagnóstico del motor usado
+                  console.info('[Bitácora V17.2.4]', dosis.clave, 'motor:', res._motor_usado || 'desconocido',
+                               '| ΔpH:', res.deltaPH, '| ΔALK:', res.deltaALK);
+                }
+              } catch (e) {
+                console.warn('[Bitácora V17.2.4] Cálculo de deltas falló para', dosis.clave, e);
+              }
+            });
+            // V17.2.4 END MOD
+          }
+
+          if (Object.keys(deltas).length > 0) {
+            window.EventBus.dispatch('bitacora:guardada', {
+              poolId: servicio.pool_id,
+              tipo: 'DOSIFICACION',
+              tipoEvento: 'DOSIFICACION',
+              deltas,
+              dosificaciones: servicio.dosificaciones,
+              timestamp: servicio.timestamp
+            });
+          }
+        }
+
+        window.EventBus.dispatch('bitacora:servicio_completo', {
+          poolId: servicio.pool_id,
+          servicioId: servicio.id,
+          tipo_servicio: servicio.tipo_servicio,
+          timestamp: servicio.timestamp
+        });
+      }
+
+      // ── 5. Fotos ya no se guardan (V17.2.0 REMOVED) ──
+
+      // ── 6. Confirmación ──
+      _toast('Bitácora guardada exitosamente.', 'success', 4000);
+      console.info(`[Bitácora] Servicio ${servicio.id} guardado para ${servicio.pool_id}.`);
+
+      _resetFormulario();
+
+    } catch (err) {
+      console.error('[Bitácora] Error crítico al guardar:', err);
+      _toast('Error al guardar bitácora: ' + err.message, 'error', 5000);
+    }
+  }
+
+  // ────────────────────────────────────────────────
+  //  REPORTE WHATSAPP
+  // ────────────────────────────────────────────────
+
+  /**
+   * Genera el texto de resumen para WhatsApp.
+   * V16.7.0 GEMINI-MOD: anota modo ácido.
+   * @returns {string}
+   * @private
+   */
+  function _generarResumenWhatsApp() {
+    const servicio = _construirObjetoServicio();
+    if (!servicio) return '';
+
+    const gemelo = _gemeloActivo;
+    const alias = gemelo?.metadata?.alias_alberca || 'Alberca';
+    const cliente = gemelo?.metadata?.cliente || '';
+    const lc = servicio.lectura_colorq;
+
+    let texto = `🏊 *Pool Balance — Reporte de Servicio*\n`;
+    texto += `━━━━━━━━━━━━━━━━━━━\n`;
+    texto += `📍 *${alias}*${cliente ? ` (${cliente})` : ''}\n`;
+    texto += `📅 ${new Date(servicio.timestamp).toLocaleDateString('es-MX', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}\n`;
+    texto += `👷 ${servicio.tecnico}\n`;
+    texto += `🔧 ${TIPOS_SERVICIO.find(t => t.value === servicio.tipo_servicio)?.label || servicio.tipo_servicio}\n`;
+    texto += `\n`;
+
+    const checks = [];
+    if (servicio.checklist_mecanico.cepillado) checks.push('Cepillado');
+    if (servicio.checklist_mecanico.aspirado) checks.push('Aspirado');
+    if (servicio.checklist_mecanico.canastillas) checks.push('Canastillas');
+    if (servicio.checklist_mecanico.red_hojas) checks.push('Red/Hojas');
+    if (servicio.checklist_mecanico.filtro_presion) checks.push('Filtro/Presión');
+    if (servicio.checklist_mecanico.nivel_agua) checks.push('Nivel agua');
+    if (checks.length > 0) texto += `✅ *Checklist:* ${checks.join(', ')}\n`;
+
+    if (servicio.estado_hidraulico_llegada.psi_llegada > 0) {
+      texto += `🔴 Presión filtro: ${servicio.estado_hidraulico_llegada.psi_llegada} PSI\n`;
+    }
+
+    texto += `\n`;
+
+    if (lc.ph > 0 || lc.cloro_libre > 0) {
+      texto += `📊 *Lectura ColorQ Pro 7:*\n`;
+      if (lc.ph > 0) texto += `   pH: ${lc.ph}\n`;
+      if (lc.cloro_libre > 0) texto += `   Cl libre: ${lc.cloro_libre} ppm\n`;
+      if (lc.cloro_combinado > 0) texto += `   Cl combinado: ${lc.cloro_combinado} ppm\n`;
+      if (lc.alcalinidad > 0) texto += `   Alcalinidad: ${lc.alcalinidad} ppm\n`;
+      if (lc.dureza_calcica > 0) texto += `   Dureza Ca: ${lc.dureza_calcica} ppm\n`;
+      if (lc.cianurico > 0) texto += `   CYA: ${lc.cianurico} ppm\n`;
+      if (lc.tds > 0) texto += `   TDS: ${lc.tds} ppm\n`;
+      if (lc.temperatura > 0) texto += `   Temp: ${lc.temperatura}°C\n`;
+      texto += `   Turbidez: ${lc.turbidez}\n`;
+
+      if (window.Calculadoras) {
+        const isv = window.Calculadoras.calcISVRapido({
+          ph: lc.ph, temperatura: lc.temperatura,
+          dureza: lc.dureza_calcica, alcalinidad: lc.alcalinidad,
+          cianurico: lc.cianurico, tds: lc.tds,
+          recubrimiento: gemelo?.geometria_adn?.recubrimiento?.tipo?.toLowerCase() || 'porcelanato'
+        });
+        if (isv) texto += `   *ISV: ${isv.isv} (${isv.estado})*\n`;
+      }
+      texto += `\n`;
+    }
+
+    if (servicio.balance_hidrico.retrolavado.realizado) {
+      texto += `🔄 *Retrolavado:* ${servicio.balance_hidrico.retrolavado.duracion_min} min → ${servicio.balance_hidrico.retrolavado.litros_perdidos.toLocaleString('es-MX')} L\n`;
+    }
+    if (servicio.balance_hidrico.llenado.realizado) {
+      texto += `💧 *Llenado:* ${servicio.balance_hidrico.llenado.litros_agregados.toLocaleString('es-MX')} L\n`;
+    }
+
+    if (servicio.dosificaciones.length > 0) {
+      texto += `\n🧪 *Dosificación:*\n`;
+      servicio.dosificaciones.forEach((d) => {
+        const anotacionModo = d.modo_acido === 'alk' ? ' (Modo: Bajar ALK)' :
+                              d.modo_acido === 'ph'  ? ' (Modo: Bajar pH)'  : '';
+        texto += `   • ${d.nombre}: ${d.cantidad} ${d.unidad}${anotacionModo}\n`;
+      });
+    }
+
+    const factores = [];
+    if (servicio.factores_externos.evento_norte) factores.push('Norte/Viento');
+    if (servicio.factores_externos.lluvia_intensa) factores.push('Lluvia');
+    if (servicio.factores_externos.pool_party) factores.push('Pool Party');
+    if (servicio.factores_externos.hojas_materia_organica) factores.push('Hojas/MO');
+    if (factores.length > 0) texto += `\n🌦️ *Factores externos:* ${factores.join(', ')}\n`;
+
+    if (servicio.observaciones) texto += `\n📝 *Observaciones:* ${servicio.observaciones}\n`;
+
+    texto += `\n━━━━━━━━━━━━━━━━━━━\n`;
+    texto += `🔬 Pool Balance V15 · Gemelo Digital\n`;
+    texto += `${FIRMA}`;
+
+    return texto;
+  }
+
+  function _vistaPrevia() {
+    const texto = _generarResumenWhatsApp();
+    if (!texto) return;
+
+    const panel = $('reporte-preview');
+    if (panel) {
+      panel.style.display = 'block';
+      panel.innerHTML = `<pre style="white-space:pre-wrap;font-size:0.82rem;padding:12px;
+        background:#f0f9ff;border-radius:8px;border:1px solid #bae6fd;max-height:400px;
+        overflow-y:auto;font-family:system-ui,sans-serif">${texto}</pre>`;
+    }
+  }
+
+  function _enviarWhatsApp() {
+    const texto = _generarResumenWhatsApp();
+    if (!texto) return;
+
+    let numero = _gemeloActivo?.metadata?.wa_contacto || '';
+    if (!numero) {
+      window.open(`https://wa.me/?text=${encodeURIComponent(texto)}`, '_blank');
+      return;
+    }
+    numero = numero.replace(/[^0-9]/g, '');
+    window.open(`https://wa.me/${numero}?text=${encodeURIComponent(texto)}`, '_blank');
+  }
+
+  // ────────────────────────────────────────────────
+  //  RESET DEL FORMULARIO
+  // ────────────────────────────────────────────────
+
+  function _resetFormulario() {
+    if (_cronometroRetroActivo) {
+      clearInterval(_cronometroRetroInterval);
+      _cronometroRetroActivo = false;
+    }
+    if (_cronometroLlenadoActivo) {
+      clearInterval(_cronometroLlenadoInterval);
+      _cronometroLlenadoActivo = false;
+    }
+    _cronometroRetroSegundos = 0;
+    _cronometroLlenadoSegundos = 0;
+
+    const cronoRetro = $('crono-retro-display');
+    if (cronoRetro) cronoRetro.textContent = '00:00';
+    const cronoLlenado = $('crono-llenado-display');
+    if (cronoLlenado) cronoLlenado.textContent = '00:00';
+
+    const btnIniciarRetro = $('btn-iniciar-retro');
+    if (btnIniciarRetro) btnIniciarRetro.disabled = false;
+    const btnDetenerRetro = $('btn-detener-retro');
+    if (btnDetenerRetro) { btnDetenerRetro.disabled = true; btnDetenerRetro.textContent = 'Detener Retrolavado'; }
+    const btnIniciarLlenado = $('btn-iniciar-llenado');
+    if (btnIniciarLlenado) btnIniciarLlenado.disabled = false;
+    const btnDetenerLlenado = $('btn-detener-llenado');
+    if (btnDetenerLlenado) { btnDetenerLlenado.disabled = true; btnDetenerLlenado.textContent = 'Detener Llenado'; }
+
+    const dosContainer = $('dosificacion-container');
+    if (dosContainer) dosContainer.innerHTML = '';
+
+    _previewDebounce.forEach((t) => clearTimeout(t));
+    _previewDebounce.clear();
+    _actualizarEstadoGuardado();
+
+    const retroReport = $('retro-live-report');
+    if (retroReport) retroReport.innerHTML = '';
+    const llenadoReport = $('llenado-live-report');
+    if (llenadoReport) llenadoReport.innerHTML = '';
+    const previewReport = $('reporte-preview');
+    if (previewReport) { previewReport.innerHTML = ''; previewReport.style.display = 'none'; }
+
+    const camposLimpiar = [
+      'bit-presion-llegada', 'bit-horas-filtracion', 'bit-horas-hidrojets', 'bit-horas-cascadas',
+      'bit-ph', 'bit-cloro-libre', 'bit-cloro-total', 'bit-cloro-combinado',
+      'bit-alcalinidad', 'bit-dureza', 'bit-cianurico', 'bit-tds', 'bit-temperatura',
+      'bit-duracion-min', 'bit-litros-llenado', 'bit-observaciones'
+    ];
+    camposLimpiar.forEach((id) => { const el = $(id); if (el) el.value = ''; });
+
+    const checkboxes = [
+      'chk-cepillado', 'chk-aspirado', 'chk-canastillas', 'chk-red',
+      'chk-filtro', 'chk-nivel', 'chk-evento-norte', 'chk-lluvia',
+      'chk-pool-party', 'chk-hojas'
+    ];
+    checkboxes.forEach((id) => { const el = $(id); if (el) el.checked = false; });
+
+    const descInv = $('bit-descontar-inv');
+    if (descInv) descInv.checked = true;
+
+    const turbidez = $('bit-turbidez');
+    if (turbidez) turbidez.value = 'cristalina';
+
+    const fecha = $('bit-fecha');
+    if (fecha) fecha.value = _nowDatetimeLocal();
+
+    _dosificacionRowCounter = 0;
+    window.__bitacoraUltimoAncla = null;
+  }
+
+  // ────────────────────────────────────────────────
+  //  MÓDULO PÚBLICO: BITACORA
+  // ────────────────────────────────────────────────
+
+  const Bitacora = {
+
+    /** V17.2.3 — Versión pública del módulo. */
+    VERSION: VERSION,
+
+    init() {
+      if (!window.DB)       console.warn('[Bitácora] window.DB no disponible. Persistencia limitada.');
+      if (!window.EventBus) console.warn('[Bitácora] window.EventBus no disponible. Sin comunicación con Engine.');
+      if (!window.Chemistry) console.warn('[Bitácora] window.Chemistry no disponible. Cálculos limitados.');
+
+      _cargarSelectorAlbercas();
+
+      const fecha = $('bit-fecha');
+      if (fecha) fecha.value = _nowDatetimeLocal();
+
+      const tecnico = $('bit-tecnico');
+      if (tecnico) {
+        const tecnicoGuardado = localStorage.getItem('pb_tecnico_nombre') || 'Omar Alberto Valle Mercado';
+        tecnico.value = tecnicoGuardado;
+        tecnico.addEventListener('change', () => {
+          localStorage.setItem('pb_tecnico_nombre', tecnico.value);
+        });
+      }
+
+      const descInv = $('bit-descontar-inv');
+      if (descInv) descInv.checked = true;
+
+      _bindEvent('bit-alberca', 'change', _onAlbercaChange);
+      _bindEvent('btn-anclar-colorq', 'click', _anclarLecturaColorQ);
+
+      _bindEvent('bit-cloro-libre', 'input', _calcularCloroCombinado);
+      _bindEvent('bit-cloro-total', 'input', _calcularCloroCombinado);
+
+      const camposCtxQuim = ['bit-ph', 'bit-alcalinidad', 'bit-temperatura',
+                             'bit-dureza', 'bit-cianurico', 'bit-tds'];
+      camposCtxQuim.forEach((id) => {
+        const el = $(id);
+        if (el) el.addEventListener('input', () => _recalcularTodosLosPreviews());
+      });
+
+      _bindEvent('btn-iniciar-retro', 'click', _iniciarCronoRetro);
+      _bindEvent('btn-detener-retro', 'click', _detenerCronoRetro);
+      _bindEvent('btn-iniciar-llenado', 'click', _iniciarCronoLlenado);
+      _bindEvent('btn-detener-llenado', 'click', _detenerCronoLlenado);
+
+      _bindEvent('bit-duracion-min', 'input', _actualizarReporteRetroVivo);
+      _bindEvent('bit-litros-llenado', 'input', _actualizarReporteLlenadoVivo);
+
+      _bindEvent('btn-agregar-dosificacion', 'click', _agregarFilaDosificacion);
+
+      _bindEvent('btn-guardar-bitacora', 'click', _guardarBitacora);
+      _bindEvent('btn-vista-previa', 'click', _vistaPrevia);
+      _bindEvent('btn-enviar-whatsapp', 'click', _enviarWhatsApp);
+
+      // V17.2.0 ADD: listeners reactivos
+      const tipoSel = document.getElementById('bit-tipo');
+      if (tipoSel) {
+        tipoSel.addEventListener('change', function() {
+          _actualizarSubselectoresTipo();
+          _evaluarOverrideTipoServicio();
+          _recalcularTodosLosPreviews();
+        });
+      }
+
+      ['bit-claridad','bit-tipo-alga-presunta'].forEach(function(id) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', function() {
+          _evaluarOverrideTipoServicio();
+          _recalcularTodosLosPreviews();
+        });
+      });
+
+      document.querySelectorAll('input[name="bit-naturaleza-color"]').forEach(function(r) {
+        r.addEventListener('change', function() {
+          _evaluarOverrideTipoServicio();
+          _recalcularTodosLosPreviews();
+        });
+      });
+
+      const psiInp = document.getElementById('bit-psi-llegada');
+      if (psiInp) {
+        psiInp.addEventListener('input', function() {
+          const poolId = _albercaActivaId;
+          const alberca = (poolId && window.DB) ? DB.getAlberca(poolId) : null;
+          const psiLimpio = (alberca && alberca.equipo && alberca.equipo.psi_limpio)
+                            ? parseFloat(alberca.equipo.psi_limpio) : null;
+          const psiAct = parseFloat(psiInp.value) || null;
+          const hint = document.getElementById('bit-psi-hint');
+          if (!hint) return;
+          if (psiAct !== null && psiLimpio !== null) {
+            const delta = psiAct - psiLimpio;
+            if (delta > 8) {
+              hint.textContent = 'Presión actual ' + psiAct + ' PSI vs limpio ' + psiLimpio +
+                                 ' PSI. Delta ' + delta.toFixed(0) + ' PSI. Considera retrolavado.';
+              hint.style.color = '#b45309';
+            } else {
+              hint.textContent = 'Delta: ' + delta.toFixed(0) + ' PSI (OK)';
+              hint.style.color = '#666';
+            }
+          } else {
+            hint.textContent = '';
+          }
+        });
+      }
+
+      const btnAnclar = document.getElementById('bit-btn-anclar-diagnostico');
+      if (btnAnclar) {
+        btnAnclar.addEventListener('click', function() { _anclarDiagnostico(); });
+      }
+
+      // Suscripciones EventBus
+      if (window.EventBus) {
+        window.EventBus.on('alberca:created', _cargarSelectorAlbercas);
+        window.EventBus.on('alberca:updated', _cargarSelectorAlbercas);
+        window.EventBus.on('alberca:deleted', () => {
+          _cargarSelectorAlbercas();
+          if (_albercaActivaId) {
+            const existe = window.DB ? DB.getAlberca(_albercaActivaId) : null;
+            if (!existe) { _albercaActivaId = null; _gemeloActivo = null; }
+          }
+        });
+      }
+
+      console.info(`[Bitácora] Módulo inicializado. Pool Balance V${VERSION}.`);
+      return true;
+    },
+
+    seleccionarAlberca(poolId) {
+      const select = $('bit-alberca');
+      if (select && poolId) {
+        select.value = poolId;
+        _onAlbercaChange();
+      }
+    },
+
+    getAlbercaActiva() {
+      return _albercaActivaId;
+    },
+
+    generarResumen() {
+      return _generarResumenWhatsApp();
+    },
+
+    reset() {
+      _resetFormulario();
+    }
+  };
+
+  function _bindEvent(id, evento, handler) {
+    const el = $(id);
+    if (el) el.addEventListener(evento, handler);
+  }
+
+  window.Bitacora = Bitacora;
+
+  // V17.2.3 — Log de carga con versión.
+  console.info(
+    `[Bitácora] V${VERSION} cargado · ` +
+    `FIX N-02: DB.saveServicio · ` +
+    `FIX BUG-007: diagnostico_anclado completo + Engine.proyectarEstadoActual · ` +
+    `FIX BUG-002: bloqueo cloro modo metales · ` +
+    `FIX DELTA-PH-RESCATE: Entregable F en rescate/severa/ALK<80`
+  );
+
+})();
